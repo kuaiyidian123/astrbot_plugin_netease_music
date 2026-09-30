@@ -1,0 +1,21 @@
+name: astrbot_plugin_netease_music
+display_name: 网易云点歌
+version: 1.0.0
+author: AstrBot Community
+repo: https://github.com/AstrBotDevs/astrbot_plugin_netease_music
+desc: |
+  网易云音乐点歌插件。通过 Cookie 导入方式获取会员权限，发送 /点歌 歌名 搜索歌曲并返回图片列表，选择歌曲后以语音发送。
+
+  ## 功能说明
+  - 🎵 按歌名搜索网易云音乐，返回最多 20 首歌曲的图片列表
+  - 🔑 支持导入浏览器 Cookie，获取更高音质与完整资源
+  - 🎙️ 选择歌曲后以语音消息发送到聊天
+
+  ## 指令说明
+  - /点歌 <歌名> - 搜索歌曲并返回图片列表
+  - /选歌 <序号> - 选择序号对应的歌曲并播放
+  - /导入cookie - 查看 Cookie 导入教程
+  - /查看cookie - 查看当前登录状态
+  - /清除cookie - 清除已保存的 Cookie
+
+astrbot_version: '>=4.17.0'
