@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Any
 
 # ============= AstrBot API =============
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api.message_components import Plain, Image, Record, File
 from astrbot.api import logger
 
@@ -91,6 +91,7 @@ PLAYLIST_MARKER = ".netease_playlist"  # 歌单标记文件，用于识别本插
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024  # 音频单文件下载上限（128MB），防止内存尖峰
 MAX_COVER_BYTES = 10 * 1024 * 1024      # 封面单文件下载上限（10MB）
 MAX_SEARCH_LIMIT = 500                  # 单次搜索出图数量硬上限，防止一次请求打满渲染与发送
+MAX_SEARCH_CACHE_ENTRIES = 50           # 搜索结果缓存条目上限，防止只搜不点导致内存堆积
 # 临时文件命名前缀（独立命名空间，避免与其它程序同前缀文件互相误删）
 TEMP_FILE_PREFIX = "netease_music_"
 
@@ -197,7 +198,7 @@ DEFAULT_HEADERS = {
     "astrbot_plugin_netease_music",
     "kuaiyidian123",
     "网易云点歌插件，支持 Cookie 导入登录，搜索歌曲并返回图片列表，选择后以语音发送",
-    "1.4.8",
+    "1.4.9",
     "https://github.com/kuaiyidian123/astrbot_plugin_netease_music"
 )
 class NeteaseMusicPlugin(Star):
@@ -209,10 +210,27 @@ class NeteaseMusicPlugin(Star):
         user_config = dict(config) if config else {}
         self.config = {**DEFAULT_CONFIG, **user_config}
 
-        # 持久化目录
-        data_dir = os.path.join(
-            os.getcwd(), 'data', 'plugin_data', 'astrbot_plugin_netease_music'
-        )
+        # 兼容旧配置：v1.4.0 把 random_bg_cache_minutes 改名为 random_bg_cache_seconds，
+        # 老用户配置里仍是旧键名，这里折算为秒，避免升级后缓存时长静默失效
+        if 'random_bg_cache_minutes' in user_config and 'random_bg_cache_seconds' not in user_config:
+            try:
+                minutes = int(user_config['random_bg_cache_minutes'])
+                self.config['random_bg_cache_seconds'] = minutes * 60
+                logger.info(
+                    f"检测到旧配置 random_bg_cache_minutes={minutes}，"
+                    f"已折算为 random_bg_cache_seconds={minutes * 60}，请尽快更新配置"
+                )
+            except (TypeError, ValueError):
+                logger.warning("旧配置 random_bg_cache_minutes 值非法，已忽略并沿用默认值")
+
+        # 持久化目录：优先使用框架接口（兼容 ASTRBOT_ROOT / 桌面运行时），失败回退到 cwd 约定
+        try:
+            data_dir = str(StarTools.get_data_dir("astrbot_plugin_netease_music"))
+        except Exception as e:
+            logger.warning(f"获取框架数据目录失败，回退到默认路径: {e}")
+            data_dir = os.path.join(
+                os.getcwd(), 'data', 'plugin_data', 'astrbot_plugin_netease_music'
+            )
         os.makedirs(data_dir, exist_ok=True)
         self.data_dir = data_dir
 
@@ -420,7 +438,7 @@ class NeteaseMusicPlugin(Star):
         try:
             session = await self._get_http_session()
             proxy = self._get_proxy()
-            params = params or {}
+            params = dict(params or {})
             params['timestamp'] = int(time.time() * 1000)
 
             async with session.get(
@@ -439,7 +457,7 @@ class NeteaseMusicPlugin(Star):
         try:
             session = await self._get_http_session()
             proxy = self._get_proxy()
-            params = params or {}
+            params = dict(params or {})
             params['timestamp'] = int(time.time() * 1000)
 
             headers = {**DEFAULT_HEADERS, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}
@@ -537,7 +555,6 @@ class NeteaseMusicPlugin(Star):
             expire_minutes = self.config.get("search_cache_expire_minutes", 10)
             self.search_cache[session_key] = {
                 'expire_time': time.time() + expire_minutes * 60,
-                'selected': set(),
                 'songs': [
                     {
                         'id': s.get('id'),
@@ -606,6 +623,11 @@ class NeteaseMusicPlugin(Star):
                     "❌ 未找到对应的搜索结果，请先发送 /点歌 歌名 进行搜索。"
                 )
             return
+        # 裸数字（非唤醒）越界时静默返回，避免群里闲聊数字被回一条报错
+        if not event.is_at_or_wake_command:
+            m = re.match(r'^(\d+)', event.message_str.strip())
+            if m and not (1 <= int(m.group(1)) <= len(cache_data.get('songs', []))):
+                return
         async for result in self._do_select(event, event.message_str.strip()):
             yield result
 
@@ -719,7 +741,7 @@ class NeteaseMusicPlugin(Star):
                     yield event.plain_result(marker_err)
                     return
 
-                # 歌单所有权校验：已绑定歌单仅歌单主/成员可添加歌曲
+                # 歌单所有权校验：需先绑定，且仅歌单主/成员可添加歌曲
                 denied = self._check_admin(download_playlist, playlist_dir, event)
                 if denied:
                     yield event.plain_result(denied)
@@ -830,13 +852,9 @@ class NeteaseMusicPlugin(Star):
         if _off:
             yield event.plain_result(_off)
             return
-        raw = event.message_str
+        # 只剥离消息开头的唤醒前缀与命令名，避免歌单名中的「歌单」二字被误替换
         # 兼容 AstrBot 传入 "/歌单 xxx" 或 "歌单 xxx" 或 "/歌单/ xxx" 多种情况
-        text = raw.replace("/歌单", " ").replace("歌单", " ").strip()
-        # 清理残留的前导斜杠和多余空格
-        while text.startswith("/"):
-            text = text[1:].strip()
-        text = re.sub(r'\s+', ' ', text)
+        text = self._strip_command(event.message_str, "歌单")
 
         if not text:
             yield event.plain_result(
@@ -1324,10 +1342,12 @@ class NeteaseMusicPlugin(Star):
             if denied:
                 yield event.plain_result(denied)
                 return
-            binding = self._load_binding(playlist_dir)
-            public = not bool(binding.get('comment_public'))
-            binding['comment_public'] = public
-            if not self._save_binding(playlist_dir, binding):
+            async with self._binding_lock:
+                binding = self._load_binding(playlist_dir)
+                public = not bool(binding.get('comment_public'))
+                binding['comment_public'] = public
+                saved = self._save_binding(playlist_dir, binding)
+            if not saved:
                 yield event.plain_result("❌ 设置失败（磁盘写入异常）")
                 return
             if public:
@@ -1403,7 +1423,7 @@ class NeteaseMusicPlugin(Star):
             return
 
         # 添加留言：开启公开留言后所有人可写；否则仅歌单主/成员可写
-        # （未绑定歌单 _is_admin 恒为真，等效公开，与其它指令一致）
+        # （未绑定歌单会提示先 /绑定，不再默认放开）
         if not self._load_binding(playlist_dir).get('comment_public'):
             denied = self._check_admin(playlist_name, playlist_dir, event)
             if denied:
@@ -1749,27 +1769,29 @@ class NeteaseMusicPlugin(Star):
             return
         name = self._get_user_name(event)
 
-        binding = self._load_binding(playlist_dir)
-        owner = binding.get('owner') or {}
-        if owner.get('user_id'):
-            if owner.get('user_id') == uid:
-                yield event.plain_result(f"ℹ️ 歌单「{playlist_name}」已经是你绑定的了")
+        async with self._binding_lock:
+            binding = self._load_binding(playlist_dir)
+            owner = binding.get('owner') or {}
+            if owner.get('user_id'):
+                if owner.get('user_id') == uid:
+                    err = f"ℹ️ 歌单「{playlist_name}」已经是你绑定的了"
+                else:
+                    err = (
+                        f"❌ 歌单「{playlist_name}」已被 {owner.get('name', '未知用户')} 绑定\n"
+                        f"发送 /绑定查看 {playlist_name} 查看成员"
+                    )
             else:
-                yield event.plain_result(
-                    f"❌ 歌单「{playlist_name}」已被 {owner.get('name', '未知用户')} 绑定\n"
-                    f"发送 /绑定查看 {playlist_name} 查看成员"
-                )
-            return
+                binding['owner'] = {
+                    "user_id": uid,
+                    "name": name,
+                    "bound_at": time.strftime("%Y-%m-%d %H:%M"),
+                }
+                binding.setdefault('members', [])
+                binding.setdefault('pending', [])
+                err = None if self._save_binding(playlist_dir, binding) else "❌ 绑定失败（磁盘写入异常）"
 
-        binding['owner'] = {
-            "user_id": uid,
-            "name": name,
-            "bound_at": time.strftime("%Y-%m-%d %H:%M"),
-        }
-        binding.setdefault('members', [])
-        binding.setdefault('pending', [])
-        if not self._save_binding(playlist_dir, binding):
-            yield event.plain_result("❌ 绑定失败（磁盘写入异常）")
+        if err:
+            yield event.plain_result(err)
             return
 
         yield event.plain_result(
@@ -1825,35 +1847,35 @@ class NeteaseMusicPlugin(Star):
             yield event.plain_result(f"❌ 歌单「{playlist_name}」不存在")
             return
 
-        binding = self._load_binding(playlist_dir)
-        owner = binding.get('owner') or {}
-        if owner.get('user_id') != uid:
-            yield event.plain_result(
-                f"❌ 只有歌单主可以邀请成员\n"
-                f"当前歌单主：{owner.get('name', '未知用户')}"
-            )
-            return
-        if target_id == uid:
-            yield event.plain_result("❌ 不能邀请自己")
-            return
-        if target_id == owner.get('user_id') or any(
-            m.get('user_id') == target_id for m in binding.get('members', [])
-        ):
-            yield event.plain_result("ℹ️ 该用户已经是歌单成员了")
-            return
+        async with self._binding_lock:
+            binding = self._load_binding(playlist_dir)
+            owner = binding.get('owner') or {}
+            if owner.get('user_id') != uid:
+                err = (
+                    f"❌ 只有歌单主可以邀请成员\n"
+                    f"当前歌单主：{owner.get('name', '未知用户')}"
+                )
+            elif target_id == uid:
+                err = "❌ 不能邀请自己"
+            elif target_id == owner.get('user_id') or any(
+                m.get('user_id') == target_id for m in binding.get('members', [])
+            ):
+                err = "ℹ️ 该用户已经是歌单成员了"
+            else:
+                binding = self._clean_pending(binding)
+                pending = [p for p in binding.get('pending', []) if p.get('user_id') != target_id]
+                pending.append({
+                    "user_id": target_id,
+                    "name": target_name or target_id,
+                    "invited_by": uid,
+                    "invited_by_name": self._get_user_name(event),
+                    "expire_at": time.time() + INVITE_TTL_SECONDS,
+                })
+                binding['pending'] = pending
+                err = None if self._save_binding(playlist_dir, binding) else "❌ 邀请失败（磁盘写入异常）"
 
-        binding = self._clean_pending(binding)
-        pending = [p for p in binding.get('pending', []) if p.get('user_id') != target_id]
-        pending.append({
-            "user_id": target_id,
-            "name": target_name or target_id,
-            "invited_by": uid,
-            "invited_by_name": self._get_user_name(event),
-            "expire_at": time.time() + INVITE_TTL_SECONDS,
-        })
-        binding['pending'] = pending
-        if not self._save_binding(playlist_dir, binding):
-            yield event.plain_result("❌ 邀请失败（磁盘写入异常）")
+        if err:
+            yield event.plain_result(err)
             return
 
         tip = (
@@ -1893,25 +1915,25 @@ class NeteaseMusicPlugin(Star):
             return
 
         uid = self._get_user_id(event)
-        binding = self._clean_pending(self._load_binding(playlist_dir))
-        pending = binding.get('pending', [])
-        hit = next((p for p in pending if p.get('user_id') == uid), None)
-        if not hit:
-            yield event.plain_result(
-                f"❌ 没有找到你针对歌单「{playlist_name}」的有效邀请（可能已过期）"
-            )
-            return
+        async with self._binding_lock:
+            binding = self._clean_pending(self._load_binding(playlist_dir))
+            pending = binding.get('pending', [])
+            hit = next((p for p in pending if p.get('user_id') == uid), None)
+            if not hit:
+                err = f"❌ 没有找到你针对歌单「{playlist_name}」的有效邀请（可能已过期）"
+            else:
+                binding['pending'] = [p for p in pending if p.get('user_id') != uid]
+                binding.setdefault('members', []).append({
+                    "user_id": uid,
+                    "name": self._get_user_name(event),
+                    "invited": True,
+                    "invited_by": hit.get('invited_by_name', ''),
+                    "joined_at": time.strftime("%Y-%m-%d %H:%M"),
+                })
+                err = None if self._save_binding(playlist_dir, binding) else "❌ 加入失败（磁盘写入异常）"
 
-        binding['pending'] = [p for p in pending if p.get('user_id') != uid]
-        binding.setdefault('members', []).append({
-            "user_id": uid,
-            "name": self._get_user_name(event),
-            "invited": True,
-            "invited_by": hit.get('invited_by_name', ''),
-            "joined_at": time.strftime("%Y-%m-%d %H:%M"),
-        })
-        if not self._save_binding(playlist_dir, binding):
-            yield event.plain_result("❌ 加入失败（磁盘写入异常）")
+        if err:
+            yield event.plain_result(err)
             return
 
         yield event.plain_result(
@@ -1949,7 +1971,8 @@ class NeteaseMusicPlugin(Star):
         owner = binding.get('owner') or {}
         if not owner.get('user_id'):
             yield event.plain_result(
-                f"ℹ️ 歌单「{playlist_name}」尚未绑定，任何人都可管理\n"
+                f"ℹ️ 歌单「{playlist_name}」尚未绑定\n"
+                f"绑定后只有歌单主与成员可以添加/删除内容\n"
                 f"发送 /绑定 {playlist_name} 成为歌单主"
             )
             return
@@ -2001,28 +2024,30 @@ class NeteaseMusicPlugin(Star):
             return
 
         uid = self._get_user_id(event)
-        binding = self._load_binding(playlist_dir)
-        owner = binding.get('owner') or {}
-        if owner.get('user_id') != uid:
-            yield event.plain_result(
-                f"❌ 只有歌单主可以移除成员\n"
-                f"当前歌单主：{owner.get('name', '未知用户')}"
-            )
-            return
+        async with self._binding_lock:
+            binding = self._load_binding(playlist_dir)
+            owner = binding.get('owner') or {}
+            members = binding.get('members', [])
+            target = next((m for m in members if m.get('user_id') == target_id), None)
+            removed_name = None
+            if owner.get('user_id') != uid:
+                err = (
+                    f"❌ 只有歌单主可以移除成员\n"
+                    f"当前歌单主：{owner.get('name', '未知用户')}"
+                )
+            elif not target:
+                err = "❌ 该用户不是歌单成员"
+            else:
+                binding['members'] = [m for m in members if m.get('user_id') != target_id]
+                removed_name = target.get('name', target_name or target_id)
+                err = None if self._save_binding(playlist_dir, binding) else "❌ 移除失败（磁盘写入异常）"
 
-        members = binding.get('members', [])
-        target = next((m for m in members if m.get('user_id') == target_id), None)
-        if not target:
-            yield event.plain_result("❌ 该用户不是歌单成员")
-            return
-
-        binding['members'] = [m for m in members if m.get('user_id') != target_id]
-        if not self._save_binding(playlist_dir, binding):
-            yield event.plain_result("❌ 移除失败（磁盘写入异常）")
+        if err:
+            yield event.plain_result(err)
             return
 
         yield event.plain_result(
-            f"✅ 已移除成员：{target.get('name', target_name or target_id)}\n"
+            f"✅ 已移除成员：{removed_name}\n"
             f"📁 歌单「{playlist_name}」"
         )
         async for result in self._emit_binding(event, playlist_dir, playlist_name):
@@ -2279,10 +2304,17 @@ class NeteaseMusicPlugin(Star):
                     async with session.get(url, timeout=6, proxy=self._get_proxy()) as resp:
                         if resp.status != 200:
                             return None
-                        # 封面图较小，但仍设上限防止异常响应撑爆内存
-                        if (resp.content_length or 0) > 10 * 1024 * 1024:
+                        # 流式读取并限制大小：content_length 在 chunked 编码下为空，
+                        # 必须靠累加校验兜底，防止异常响应撑爆内存
+                        if (resp.content_length or 0) > MAX_COVER_BYTES:
                             return None
-                        data = await resp.read()
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            buf.extend(chunk)
+                            if len(buf) > MAX_COVER_BYTES:
+                                logger.debug(f"封面超过大小上限，已跳过 {sid}")
+                                return None
+                        data = bytes(buf)
                     img = PILImage.open(BytesIO(data))
                     img = img.convert('RGB')
                     return (sid, img)
@@ -2389,6 +2421,15 @@ class NeteaseMusicPlugin(Star):
         ]
         for k in expired:
             del self.search_cache[k]
+        # 容量上限：超出时按最早过期顺序淘汰（每项持有完整歌曲列表，避免无界堆积）
+        overflow = len(self.search_cache) - MAX_SEARCH_CACHE_ENTRIES
+        if overflow > 0:
+            oldest = sorted(
+                self.search_cache,
+                key=lambda k: self.search_cache[k].get('expire_time', 0)
+            )
+            for k in oldest[:overflow]:
+                del self.search_cache[k]
 
     async def _download_audio(self, url: str) -> tuple:
         proxy = self._get_proxy()
@@ -2512,9 +2553,10 @@ class NeteaseMusicPlugin(Star):
         返回 (playlist_name, song_name)，song_name 为 None 表示仅列出歌单。
         """
         try:
+            root = _get_music_root(self.config)
             folders = [
-                f for f in os.listdir(_get_music_root(self.config))
-                if os.path.isdir(os.path.join(_get_music_root(self.config), f))
+                f for f in os.listdir(root)
+                if os.path.isdir(os.path.join(root, f))
             ]
         except OSError:
             return (None, None)
@@ -2614,10 +2656,10 @@ class NeteaseMusicPlugin(Star):
 
     @staticmethod
     def _is_admin(binding: Dict, uid: str) -> bool:
-        """歌单管理员判定；歌单未绑定时不做任何限制"""
+        """歌单管理员判定；歌单未绑定时无人是管理员（需先绑定）"""
         owner = (binding or {}).get('owner') or {}
         if not owner.get('user_id'):
-            return True
+            return False
         if owner.get('user_id') == uid:
             return True
         for m in (binding or {}).get('members', []):
@@ -2728,6 +2770,13 @@ class NeteaseMusicPlugin(Star):
     def _check_admin(self, playlist_name: str, playlist_dir: str, event) -> Optional[str]:
         """校验管理权限，无权限时返回提示文案，有权限返回 None"""
         binding = self._load_binding(playlist_dir)
+        owner = binding.get('owner') or {}
+        # 未绑定歌单不再默认放开，需先绑定后再管理
+        if not owner.get('user_id'):
+            return (
+                f"⚠️ 歌单「{playlist_name}」尚未绑定，"
+                f"请先发送 /绑定 {playlist_name} 成为歌单主后再操作"
+            )
         if self._is_admin(binding, self._get_user_id(event)):
             return None
         return self._permission_denied(playlist_name, binding)

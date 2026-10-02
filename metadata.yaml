@@ -1,6 +1,6 @@
 name: astrbot_plugin_netease_music
 display_name: 网易云点歌
-version: 1.4.8
+version: 1.4.9
 author: kuaiyidian123
 repo: https://github.com/kuaiyidian123/astrbot_plugin_netease_music
 desc: |
@@ -12,19 +12,9 @@ desc: |
   - 🔑 支持导入浏览器 Cookie，获取更高音质与完整资源
   - 🎙️ 选择歌曲后以语音消息发送到聊天
   - 💬 歌曲留言与歌单绑定权限管理
+  - 🖼️ 支持纯文本发送模式（send_as_text）
 
   ## 指令说明
-  - /点歌 <歌名> - 搜索歌曲并返回图片列表
-  - /选歌 <序号> - 选择序号对应的歌曲并播放
-  - /选歌 <序号> 添加歌单 <歌单名> - 下载到本地歌单
-  - /创建歌单 <歌单名> - 创建本地歌单
-  - /歌单列表 - 列出全部歌单（图片）
-  - /歌单占用 - 查看各歌单磁盘占用（图片）
-  - /歌单 <歌单名> - 查看歌单内容
-  - /留言 <歌单名> <序号> <内容> - 给歌曲留言
-  - /绑定 <歌单名> - 绑定歌单成为歌单主
-  - /导入cookie - 导入 Cookie（仅管理员）
-  - /查看cookie - 查看当前登录状态
-  - /清除cookie - 清除已保存的 Cookie（仅管理员）
+  在聊天中发送 /点歌帮助 查看完整指令列表，或查阅 README。
 
 astrbot_version: '>=4.17.0'
