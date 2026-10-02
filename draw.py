@@ -287,7 +287,7 @@ TOTAL_WIDTH = 600
 
 # 歌单根目录（与 main.py 的 MUSIC_ROOT 一致）
 MUSIC_ROOT = r"D:\music"
-PLUGIN_VERSION = "1.5.3"  # 插件版本号（每次更新/修改递增）
+PLUGIN_VERSION = "1.5.4"  # 插件版本号（每次更新/修改递增）
 
 
 # ==================== 背景 ====================
@@ -1212,11 +1212,11 @@ def draw_playlist_usage_image(items: List[Dict], total_size: int, total_files: i
 # ==================== 帮助图片 ====================
 def draw_help_image(music_root: str = MUSIC_ROOT, size: Optional[tuple] = None,
                     bg_path: Optional[str] = None,
-                    bili_enabled: bool = False) -> BytesIO:
+                    bili_rows: Optional[list] = None) -> BytesIO:
     """绘制使用帮助图片
 
     size: (宽, 高)，默认 4320x2236；bg_path: 背景图路径，默认插件 assets/bg_help.png。
-    bili_enabled: 是否展示「B站视频」分区（由插件配置决定）。
+    bili_rows: 「B站视频」分区的指令行；为 None/空则不展示该分区（由插件配置决定）。
     """
     sections = [
         ("点歌播放", [
@@ -1226,12 +1226,9 @@ def draw_help_image(music_root: str = MUSIC_ROOT, size: Optional[tuple] = None,
         ]),
     ]
 
-    # 开启 B 站视频功能时，追加对应分区（紧随点歌播放）
-    if bili_enabled:
-        sections.insert(1, ("B站视频", [
-            ("/选歌 序号 搜索视频", "按播放量搜索该歌曲的 B 站视频"),
-            ("序号", "直接发送对应的 B 站视频文件（如 5）"),
-        ]))
+    # 开启了 B 站视频功能（任一入口）时，追加对应分区（紧随点歌播放）
+    if bili_rows:
+        sections.insert(1, ("B站视频", list(bili_rows)))
 
     sections += [
         ("本地歌单", [

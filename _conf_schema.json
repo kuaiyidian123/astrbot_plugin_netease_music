@@ -22,8 +22,8 @@
   "search_image_size": {
     "type": "string",
     "title": "搜索结果图分辨率",
-    "default": "4320x2236",
-    "description": "格式为 宽x高，例如 4320x2236、2560x1440、1920x1080。数值越大出图越慢、文件越大；建议宽度 1280~5120、高度 720~2880。留空或格式错误时使用默认 4320x2236。"
+    "default": "",
+    "description": "格式为 宽x高，例如 4320x2236。不填默认自适应。"
   },
   "search_bg_image": {
     "type": "file",
@@ -36,7 +36,7 @@
     "type": "string",
     "title": "帮助图分辨率",
     "default": "",
-    "description": "格式为 宽x高，例如 4320x2236、2560x1440。留空（默认）= 自动跟随背景图实际分辨率，输出图与背景图 1:1、不裁切，文字自动缩放；填写则按填写值输出。"
+    "description": "格式为 宽x高，例如 4320x2236。不填默认自适应。"
   },
   "help_bg_image": {
     "type": "file",
@@ -92,9 +92,15 @@
   },
   "enable_bilibili_video": {
     "type": "bool",
-    "title": "开启B站视频搜索",
+    "title": "开启「选歌搜视频」（按歌曲搜）",
     "default": false,
-    "description": "开启后，发送「/选歌 序号 搜索视频」会去哔哩哔哩搜索该歌曲的相关视频（按播放量排序）并返回列表，再发送「视频N」即可把对应视频文件发送到聊天。关闭后该功能不可用。"
+    "description": "控制「选歌搜视频」入口：/点歌 歌名 后发送「序号 搜索视频」（如 1 搜索视频），按歌曲名+歌手去 B 站搜索相关视频。结果按播放量排序出图（5×5，每页 25 条），再直接发序号（如 5）即可把对应视频文件发到聊天。与下一项「/搜视频」开关互不影响。"
+  },
+  "enable_bili_search_cmd": {
+    "type": "bool",
+    "title": "开启「/搜视频」直接搜索",
+    "default": true,
+    "description": "控制「/搜视频」直接搜索入口：直接发送 /搜视频 关键词 即可搜索 B 站视频，无需先点歌；出图与发序号用法同上。与上一项开关互不影响，可单独开启或关闭。"
   },
   "bilibili_sessdata": {
     "type": "string",
@@ -134,7 +140,7 @@
     "type": "string",
     "title": "视频列表图分辨率",
     "default": "",
-    "description": "格式为 宽x高，例如 4320x2236、2560x1440、1920x1080。数值越大出图越慢、文件越大；建议宽度 1280~5120、高度 720~2880。留空或格式错误时使用默认 4320x2236。"
+    "description": "格式为 宽x高，例如 4320x2236。不填默认自适应。"
   },
   "video_bg_image": {
     "type": "file",
@@ -142,6 +148,31 @@
     "default": [],
     "file_types": ["png", "jpg", "jpeg", "webp"],
     "description": "在后台直接上传图片作为 B 站视频列表图的背景（推荐 4320x2236 及以上横版图）。未上传时使用插件 assets/bg_search.png，都没有则用内置渐变背景。"
+  },
+  "enable_random_bg_search_cmd": {
+    "type": "bool",
+    "title": "「/搜视频」列表图使用随机背景图",
+    "default": false,
+    "description": "开启后，/搜视频 结果图的背景将从下方随机图接口自动获取并定时更换，优先级高于上传的固定背景图。与「选歌搜视频」列表图、点歌结果图、帮助图的开关互相独立，可分别设置不同背景。"
+  },
+  "search_cmd_random_bg_api": {
+    "type": "string",
+    "title": "「/搜视频」列表图随机图接口（可留空）",
+    "default": "",
+    "description": "可单独为 /搜视频 的结果图指定随机图接口（需直接返回图片二进制流）。留空则沿用上方「随机图 API 地址」的通用接口。"
+  },
+  "search_cmd_image_size": {
+    "type": "string",
+    "title": "「/搜视频」列表图分辨率",
+    "default": "",
+    "description": "格式为 宽x高，例如 4320x2236。不填默认自适应。"
+  },
+  "search_cmd_bg_image": {
+    "type": "file",
+    "title": "「/搜视频」列表图背景图",
+    "default": [],
+    "file_types": ["png", "jpg", "jpeg", "webp"],
+    "description": "在后台直接上传图片作为 /搜视频 结果图的背景（推荐 4320x2236 及以上横版图）。未上传时使用插件 assets/bg_search.png，都没有则用内置渐变背景。"
   },
   "music_root": {
     "type": "string",

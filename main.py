@@ -61,16 +61,20 @@ DEFAULT_CONFIG = {
     "search_image_size": "",
     "help_image_size": "",
     "video_image_size": "",
+    "search_cmd_image_size": "",
     "enable_random_bg_search": False,
     "enable_random_bg_help": False,
     "enable_random_bg_video": False,
+    "enable_random_bg_search_cmd": False,
     "video_random_bg_api": "",
+    "search_cmd_random_bg_api": "",
     "random_bg_api": "https://uapis.cn/api/v1/random/image?type=pc",
     "random_bg_cache_seconds": 1800,
     "allow_unlogged_search": True,
     "audio_quality": "higher",
     "send_method": "auto",
     "enable_bilibili_video": False,
+    "enable_bili_search_cmd": True,
     "bilibili_sessdata": "",
     "bilibili_video_max_mb": 50,
     "bilibili_result_limit": 10,
@@ -281,7 +285,7 @@ def _format_play_count(value) -> str:
     "astrbot_plugin_netease_music",
     "kuaiyidian123",
     "网易云点歌插件，支持 Cookie 导入登录，搜索歌曲并返回图片列表，选择后以语音发送",
-    "1.5.3",
+    "1.5.4",
     "https://github.com/kuaiyidian123/astrbot_plugin_netease_music"
 )
 class NeteaseMusicPlugin(Star):
@@ -385,7 +389,7 @@ class NeteaseMusicPlugin(Star):
         背景优先级：随机图 API（开启时） > 后台上传的固定背景图 > 插件内置背景图。
         分辨率来自后台配置，非法/未设置时回退默认。
         """
-        size = parse_image_size(self.config.get("search_image_size"))
+        size = _resolve_image_size(self.config.get("search_image_size"))
         bg_path = await self._get_random_bg_path("search")
         if not bg_path:
             bg_path = _resolve_config_image(self.config.get("search_bg_image"), self.data_dir)
@@ -399,21 +403,25 @@ class NeteaseMusicPlugin(Star):
             bg_path = _resolve_config_image(self.config.get("help_bg_image"), self.data_dir)
         return size, bg_path
 
-    async def _get_video_image_options(self):
-        """B 站视频列表图 (分辨率, 背景图路径)，背景优先级同搜索结果图
+    async def _get_bili_image_options(self, kind: str = "video"):
+        """B 站视频列表图 (分辨率, 背景图路径)
 
-        与点歌结果图/帮助图各自独立：开关、缓存文件、背景图互不影响。
+        kind: 'video' = 选歌搜视频；'cmd' = /搜视频 直接搜索。
+        两套配置彼此完全独立（开关、随机图接口、缓存文件、背景图、分辨率互不影响），
+        背景优先级：随机图 API（开启时） > 后台上传的固定背景图 > 内置/渐变。
         """
-        size = parse_image_size(self.config.get("video_image_size"))
-        bg_path = await self._get_random_bg_path("video")
+        size_key = "search_cmd_image_size" if kind == "cmd" else "video_image_size"
+        bg_key = "search_cmd_bg_image" if kind == "cmd" else "video_bg_image"
+        size = _resolve_image_size(self.config.get(size_key))
+        bg_path = await self._get_random_bg_path(kind)
         if not bg_path:
-            bg_path = _resolve_config_image(self.config.get("video_bg_image"), self.data_dir)
+            bg_path = _resolve_config_image(self.config.get(bg_key), self.data_dir)
         return size, bg_path
 
     # ==================== 随机背景图 ====================
 
     def _random_bg_cache_path(self, kind: str) -> str:
-        """随机背景图的本地缓存文件路径（search / help / video 各自独立）"""
+        """随机背景图的本地缓存文件路径（search / help / video / cmd 各自独立）"""
         return os.path.join(self.data_dir, f"random_bg_{kind}.jpg")
 
     async def _download_random_bg(self, api: str) -> Optional[bytes]:
@@ -441,20 +449,23 @@ class NeteaseMusicPlugin(Star):
     async def _get_random_bg_path(self, kind: str) -> Optional[str]:
         """获取随机背景图并缓存为本地文件，返回其绝对路径
 
-        kind: 'search' / 'help' / 'video'，三者开关与缓存均独立，因此可分别控制、背景互不相同。
+        kind: 'search' / 'help' / 'video' / 'cmd'，四者开关与缓存均独立，因此可分别控制、背景互不相同。
         未开启随机图、接口异常或图片无法解析时返回 None（由调用方回退到固定背景图）。
         """
         switch_key = {
             "search": "enable_random_bg_search",
             "help": "enable_random_bg_help",
             "video": "enable_random_bg_video",
+            "cmd": "enable_random_bg_search_cmd",
         }.get(kind, "enable_random_bg_search")
         if not self.config.get(switch_key, False):
             return None
-        # 视频列表图可单独指定随机图接口；留空则沿用通用接口
-        api = ""
-        if kind == "video":
-            api = str(self.config.get("video_random_bg_api") or "").strip()
+        # 视频列表图 / 「/搜视频」可分别指定随机图接口；留空则沿用通用接口
+        api_key = {
+            "video": "video_random_bg_api",
+            "cmd": "search_cmd_random_bg_api",
+        }.get(kind, "")
+        api = str(self.config.get(api_key) or "").strip() if api_key else ""
         if not api:
             api = str(self.config.get("random_bg_api") or "").strip()
         if not api:
@@ -593,10 +604,19 @@ class NeteaseMusicPlugin(Star):
         try:
             size, bg_path = await self._get_help_image_options()
 
+            # 「B站视频」分区按各自开关独立展示（两个入口互不依赖）
+            bili_rows = []
+            if self._bili_video_enabled():
+                bili_rows.append(("选歌后发 序号 搜索视频", "按歌曲搜索相关 B 站视频"))
+            if self._bili_search_cmd_enabled():
+                bili_rows.append(("/搜视频 关键词", "直接按关键词搜索 B 站视频"))
+            if bili_rows:
+                bili_rows.append(("序号", "直接发送对应的 B 站视频文件（如 5）"))
+
             def _draw():
                 return draw_help_image(
                     _get_music_root(self.config), size=size, bg_path=bg_path,
-                    bili_enabled=self._bili_video_enabled()
+                    bili_rows=bili_rows
                 )
 
             image_io = await asyncio.get_running_loop().run_in_executor(None, _draw)
@@ -733,7 +753,7 @@ class NeteaseMusicPlugin(Star):
         now = time.time()
 
         # 纯序号且最近一次是「搜索视频」→ 按视频序号发送
-        if re.fullmatch(r"\d+", text) and self._bili_video_enabled():
+        if re.fullmatch(r"\d+", text) and self._bili_any_enabled():
             video_data = self.video_cache.get(session_key)
             song_data = self.search_cache.get(session_key)
             video_fresh = bool(video_data) and video_data.get('expire_time', 0) >= now
@@ -957,12 +977,33 @@ class NeteaseMusicPlugin(Star):
             logger.error(f"选歌失败: {e}")
             yield event.plain_result("❌ 选歌失败，请稍后重试")
 
-    # ==================== 指令：发送 B 站视频 ====================
+    # ==================== 指令：搜索 / 发送 B 站视频 ====================
+
+    @filter.command("搜视频")
+    async def cmd_bili_search(self, event: AstrMessageEvent):
+        """/搜视频 关键词 → 直接搜索 B 站视频（按播放量降序），再发序号即可发送视频"""
+        if not self._bili_search_cmd_enabled():
+            yield event.plain_result("⚠️「/搜视频」指令已被管理员关闭")
+            return
+
+        text = self._strip_command(event.message_str, "搜视频")
+        if not text:
+            yield event.plain_result(
+                "请输入搜索关键词，用法：/搜视频 关键词\n"
+                "示例：/搜视频 Take Me Hand"
+            )
+            return
+        # 限制关键词长度，避免超长输入拖垮搜索出图（防 DoS）
+        if len(text) > 100:
+            text = text[:100]
+
+        async for result in self._search_bilibili_videos(event, keyword=text):
+            yield result
 
     @filter.regex(r"^视频\s*\d+$")
     async def cmd_bili_video(self, event: AstrMessageEvent):
         """发送 B 站视频（兼容写法）：「视频N」等价于直接发序号「N」"""
-        if not self._bili_video_enabled():
+        if not self._bili_any_enabled():
             if event.is_at_or_wake_command:
                 yield event.plain_result("⚠️ B 站视频功能已被管理员关闭")
             return
@@ -975,7 +1016,7 @@ class NeteaseMusicPlugin(Star):
 
     async def _do_send_video(self, event: AstrMessageEvent, index: int):
         """发送视频列表中第 index 个 B 站视频文件（纯序号与「视频N」共用）"""
-        if not self._bili_video_enabled():
+        if not self._bili_any_enabled():
             if event.is_at_or_wake_command:
                 yield event.plain_result("⚠️ B 站视频功能已被管理员关闭")
             return
@@ -1041,7 +1082,16 @@ class NeteaseMusicPlugin(Star):
         )
 
     def _bili_video_enabled(self) -> bool:
+        """「选歌搜视频」入口开关（/点歌 后发「序号 搜索视频」）"""
         return bool(self.config.get("enable_bilibili_video", False))
+
+    def _bili_search_cmd_enabled(self) -> bool:
+        """「/搜视频」直接搜索入口开关（与上一项互不依赖）"""
+        return bool(self.config.get("enable_bili_search_cmd", True))
+
+    def _bili_any_enabled(self) -> bool:
+        """任一 B 站视频入口开启（「直接发序号发送视频」与帮助展示用）"""
+        return self._bili_video_enabled() or self._bili_search_cmd_enabled()
 
     def _bili_max_mb(self) -> int:
         """单视频大小上限（MB），后台可配置，越界自动夹紧"""
@@ -1269,27 +1319,40 @@ class NeteaseMusicPlugin(Star):
         return covers
 
     async def _search_bilibili_videos(self, event: AstrMessageEvent,
-                                      song_name: str, artist_name: str):
-        """选歌后搜索 B 站视频：渲染候选列表并缓存，供「视频N」使用"""
-        if not self._bili_video_enabled():
-            yield event.plain_result("⚠️ B 站视频搜索功能已被管理员关闭")
+                                      song_name: str = "", artist_name: str = "",
+                                      keyword: str = ""):
+        """搜索 B 站视频：渲染候选列表并缓存，供直接发序号发送。
+
+        - 选歌触发：只传 song_name / artist_name（带歌手搜不到时退回只用歌名）
+        - 直接搜索：传 keyword（/搜视频 关键词）
+        """
+        if not keyword and not self._bili_video_enabled():
+            # 「选歌搜视频」入口只受该开关控制（与 /搜视频 的开关互不依赖）
+            yield event.plain_result("⚠️ 选歌时的 B 站视频搜索已被管理员关闭")
             return
 
         self._clean_expired_video_cache()
         limit = self._bili_result_limit()
-        keyword = f"{song_name} {artist_name}".strip()
-        yield event.plain_result(f"🔍 正在 B 站搜索「{keyword}」相关视频，请稍候...")
 
-        videos = await self._bili_search_videos(keyword, limit)
-        if not videos and artist_name:
-            # 带歌手搜不到时，退回只用歌名再搜一次
-            videos = await self._bili_search_videos(song_name, limit)
-            if videos:
-                keyword = song_name
+        if keyword:
+            search_keyword = keyword
+            yield event.plain_result(f"🔍 正在 B 站搜索「{search_keyword}」，请稍候...")
+            videos = await self._bili_search_videos(search_keyword, limit)
+        else:
+            search_keyword = f"{song_name} {artist_name}".strip()
+            yield event.plain_result(
+                f"🔍 正在 B 站搜索「{search_keyword}」相关视频，请稍候..."
+            )
+            videos = await self._bili_search_videos(search_keyword, limit)
+            if not videos and artist_name:
+                # 带歌手搜不到时，退回只用歌名再搜一次
+                videos = await self._bili_search_videos(song_name, limit)
+                if videos:
+                    search_keyword = song_name
 
         if not videos:
             yield event.plain_result(
-                f"😔 未在 B 站找到与「{keyword}」相关的视频，可换个关键词再试。"
+                f"😔 未在 B 站找到与「{search_keyword}」相关的视频，可换个关键词再试。"
             )
             return
 
@@ -1297,22 +1360,22 @@ class NeteaseMusicPlugin(Star):
         self.video_cache[self._get_session_key(event)] = {
             'expire_time': time.time() + expire_minutes * 60,
             'created_at': time.time(),
-            'keyword': keyword,
+            'keyword': search_keyword,
             'videos': videos,
         }
 
         if self._text_mode():
-            yield event.plain_result(self._format_videos_text(keyword, videos))
+            yield event.plain_result(self._format_videos_text(search_keyword, videos))
             return
 
         try:
             covers = await self._bili_fetch_covers(videos)
-            # 背景与分辨率使用「视频列表图」的独立配置（随机背景优先）
-            size, bg_path = await self._get_video_image_options()
+            # 背景与分辨率按入口取各自的独立配置：/搜视频 用 'cmd'，选歌搜视频用 'video'
+            size, bg_path = await self._get_bili_image_options("cmd" if keyword else "video")
 
             def _draw():
                 return draw_bilibili_videos_image(
-                    keyword, videos, covers, size=size, bg_path=bg_path,
+                    search_keyword, videos, covers, size=size, bg_path=bg_path,
                     per_page=BILI_PAGE_SIZE,
                 )
 
@@ -1326,7 +1389,7 @@ class NeteaseMusicPlugin(Star):
                 self._schedule_tempfile_cleanup(image_path)
         except Exception as e:
             logger.error(f"生成 B 站视频列表图失败: {e}")
-            yield event.plain_result(self._format_videos_text(keyword, videos))
+            yield event.plain_result(self._format_videos_text(search_keyword, videos))
 
     @staticmethod
     def _format_videos_text(keyword: str, videos: List[Dict]) -> str:
@@ -3648,7 +3711,9 @@ class NeteaseMusicPlugin(Star):
             "【账号】/导入cookie /查看cookie /清除cookie",
         ]
         if self._bili_video_enabled():
-            lines.append("【视频】/选歌 序号 搜索视频 → 再发序号")
+            lines.append("【视频】选歌时加「搜索视频」（如 1 搜索视频）→ 再发序号")
+        if self._bili_search_cmd_enabled():
+            lines.append("【视频】/搜视频 关键词 → 再发序号")
         lines += [
             "━━━━━━━━━━━━",
             "【示例】",
@@ -3659,8 +3724,10 @@ class NeteaseMusicPlugin(Star):
             "给歌留言：/留言 我的歌单 1 这首歌真好听",
             "登录会员：/导入cookie",
         ]
+        if self._bili_search_cmd_enabled():
+            lines.append("搜B站视频：/搜视频 关键词 → 再发 5")
         if self._bili_video_enabled():
-            lines.append("看B站视频：/点歌 歌名 → 再发 1 搜索视频 → 再发 5")
+            lines.append("按歌搜视频：/点歌 歌名 → 再发 1 搜索视频 → 再发 5")
         return "\n".join(lines)
 
     @staticmethod
