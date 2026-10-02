@@ -90,6 +90,59 @@
     "options": ["auto", "voice", "file", "link"],
     "description": "音频发送方式：auto 优先语音，平台不支持时回退文件；voice 强制语音；file 发送音频文件；link 发送歌曲链接。"
   },
+  "enable_bilibili_video": {
+    "type": "bool",
+    "title": "开启B站视频搜索",
+    "default": false,
+    "description": "开启后，发送「/选歌 序号 搜索视频」会去哔哩哔哩搜索该歌曲的相关视频（按播放量排序）并返回列表，再发送「视频N」即可把对应视频文件发送到聊天。关闭后该功能不可用。"
+  },
+  "bilibili_sessdata": {
+    "type": "string",
+    "title": "B站 SESSDATA（可选）",
+    "default": "",
+    "description": "可选的 B 站登录凭证：填写后可获取更高清晰度、减少风控导致的搜索/下载失败。获取方法：浏览器登录 bilibili.com → F12 → Application → Cookies → 复制 SESSDATA 的值。留空则匿名访问（通常只有 360P/480P，且可能被限流）。"
+  },
+  "bilibili_video_max_mb": {
+    "type": "int",
+    "title": "单个视频大小上限（MB）",
+    "default": 50,
+    "minimum": 1,
+    "maximum": 2048,
+    "description": "单个 B 站视频允许发送的最大体积。超过上限时不发送文件，改为回复视频链接。QQ 建议不超过 50MB。"
+  },
+  "bilibili_result_limit": {
+    "type": "int",
+    "title": "视频搜索数量上限",
+    "default": 10,
+    "minimum": 1,
+    "maximum": 100,
+    "description": "发送「序号 搜索视频」后最多返回多少个视频候选（按播放量降序），默认 10，可填 1~100。每页最多展示 25 条（5×5），超出会自动分成第 2、第 3 页图片依次发送。"
+  },
+  "enable_random_bg_video": {
+    "type": "bool",
+    "title": "视频列表图使用随机背景图",
+    "default": false,
+    "description": "开启后，B 站视频列表图的背景将从下方随机图接口自动获取并定时更换，优先级高于上传的固定背景图；关闭时使用上传的固定背景图或插件内置背景图。与点歌结果图、帮助图的开关互相独立。"
+  },
+  "video_random_bg_api": {
+    "type": "string",
+    "title": "视频列表图随机图接口（可留空）",
+    "default": "",
+    "description": "可单独为视频列表图指定随机图接口（需直接返回图片二进制流，Content-Type 为 image/*）。留空则沿用上方「随机图 API 地址」的通用接口。例如竖版可填 https://uapis.cn/api/v1/random/image?type=mp。"
+  },
+  "video_image_size": {
+    "type": "string",
+    "title": "视频列表图分辨率",
+    "default": "",
+    "description": "格式为 宽x高，例如 4320x2236、2560x1440、1920x1080。数值越大出图越慢、文件越大；建议宽度 1280~5120、高度 720~2880。留空或格式错误时使用默认 4320x2236。"
+  },
+  "video_bg_image": {
+    "type": "file",
+    "title": "视频列表图背景图",
+    "default": [],
+    "file_types": ["png", "jpg", "jpeg", "webp"],
+    "description": "在后台直接上传图片作为 B 站视频列表图的背景（推荐 4320x2236 及以上横版图）。未上传时使用插件 assets/bg_search.png，都没有则用内置渐变背景。"
+  },
   "music_root": {
     "type": "string",
     "title": "音乐文件夹保存位置",

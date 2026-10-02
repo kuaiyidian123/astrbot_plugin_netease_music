@@ -26,7 +26,15 @@ if _CORE and _CORE not in sys.path:
     sys.path.insert(0, _CORE)
 
 try:
-    from astrbot_plugin_netease_music.main import NeteaseMusicPlugin
+    from astrbot_plugin_netease_music.main import (
+        NeteaseMusicPlugin,
+        _BILI_MIXIN_KEY_ENC_TAB,
+        _bili_mixin_key,
+        _bili_wbi_sign,
+        _bili_clean_title,
+        _format_duration,
+        _format_play_count,
+    )
     _IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover - 环境缺失时跳过
     NeteaseMusicPlugin = None
@@ -119,6 +127,83 @@ class PureLogicTest(unittest.TestCase):
                 plugin._match_playlist_and_song("我的歌单 歌单"), ("我的歌单", "歌单")
             )
             self.assertEqual(plugin._match_playlist_and_song("不存在"), (None, None))
+
+
+@unittest.skipIf(NeteaseMusicPlugin is None, f"无法导入插件模块: {_IMPORT_ERROR}")
+class BilibiliPureLogicTest(unittest.TestCase):
+    """B 站相关纯逻辑（不联网）"""
+
+    def test_mixin_key_table_is_valid(self):
+        """重排表必须是 0..63 的一个完整排列"""
+        self.assertEqual(len(_BILI_MIXIN_KEY_ENC_TAB), 64)
+        self.assertEqual(sorted(_BILI_MIXIN_KEY_ENC_TAB), list(range(64)))
+
+    def test_mixin_key_length(self):
+        key = _bili_mixin_key("a" * 32, "b" * 32)
+        self.assertEqual(len(key), 32)
+
+    def test_wbi_sign_adds_fields(self):
+        signed = _bili_wbi_sign({"keyword": "abc", "page": 1}, "x" * 32)
+        self.assertIn("wts", signed)
+        self.assertIn("w_rid", signed)
+        self.assertEqual(len(signed["w_rid"]), 32)
+        # 不应改动入参
+        params = {"keyword": "abc"}
+        _bili_wbi_sign(params, "x" * 32)
+        self.assertNotIn("w_rid", params)
+
+    def test_clean_title(self):
+        self.assertEqual(_bili_clean_title('<em class="keyword">That</em> Girl'), "That Girl")
+        self.assertEqual(_bili_clean_title("A &amp; B"), "A & B")
+
+    def test_parse_duration(self):
+        parse = NeteaseMusicPlugin._bili_parse_duration
+        self.assertEqual(parse(93), 93)
+        self.assertEqual(parse("93"), 93)
+        self.assertEqual(parse("01:33"), 93)
+        self.assertEqual(parse("1:01:33"), 3693)
+        self.assertEqual(parse(""), 0)
+        self.assertEqual(parse("bad"), 0)
+
+    def test_format_duration_and_play(self):
+        self.assertEqual(_format_duration(93), "01:33")
+        self.assertEqual(_format_duration(3693), "1:01:33")
+        self.assertEqual(_format_play_count(1234), "1234")
+        self.assertEqual(_format_play_count(23456), "2.3万")
+        self.assertEqual(_format_play_count(234567890), "2.3亿")
+
+    def test_pick_streams_respects_size_limit(self):
+        """体积超限时自动降清晰度，且音轨避开杜比/Hi-Res"""
+        pick = NeteaseMusicPlugin._bili_pick_streams
+        vids = [
+            {"id": 16, "baseUrl": "v16", "bandwidth": 400 * 1024},
+            {"id": 32, "baseUrl": "v32", "bandwidth": 900 * 1024},
+            {"id": 80, "baseUrl": "v80", "bandwidth": 3000 * 1024},
+        ]
+        auds = [{"id": 30280, "baseUrl": "a192", "bandwidth": 200 * 1024}]
+        # 上限 5MB：只有最低画质(约 4.6MB)能放下
+        self.assertEqual(pick(vids, auds, 60, 5 * 1024 * 1024)[0], "v16")
+        # 上限 30MB：可选最高画质
+        self.assertEqual(pick(vids, auds, 60, 30 * 1024 * 1024)[0], "v80")
+        # 杜比/Hi-Res 音轨被排除，只选常规音轨
+        auds2 = [
+            {"id": 30250, "baseUrl": "dolby", "bandwidth": 500 * 1024},
+            {"id": 30216, "baseUrl": "a64", "bandwidth": 64 * 1024},
+        ]
+        self.assertEqual(pick(vids, auds2, 60, 100 * 1024 * 1024)[1], "a64")
+        # 没有可用视频流时返回 None
+        self.assertIsNone(pick([], auds, 60, 1024))
+
+    def test_pick_streams_prefers_h264_codec(self):
+        """同一清晰度有 H.264 / H.265 时优先 H.264（QQ 播放兼容性更好）"""
+        pick = NeteaseMusicPlugin._bili_pick_streams
+        vids = [
+            {"id": 32, "baseUrl": "v32-hev", "bandwidth": 300 * 1024,
+             "codecs": "hev1.1.6.L120.90"},
+            {"id": 32, "baseUrl": "v32-avc", "bandwidth": 320 * 1024,
+             "codecs": "avc1.64001F"},
+        ]
+        self.assertEqual(pick(vids, [], 10, 1024 * 1024)[0], "v32-avc")
 
 
 if __name__ == "__main__":

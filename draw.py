@@ -287,7 +287,7 @@ TOTAL_WIDTH = 600
 
 # 歌单根目录（与 main.py 的 MUSIC_ROOT 一致）
 MUSIC_ROOT = r"D:\music"
-PLUGIN_VERSION = "1.4.9"  # 插件版本号（每次更新/修改递增）
+PLUGIN_VERSION = "1.5.3"  # 插件版本号（每次更新/修改递增）
 
 
 # ==================== 背景 ====================
@@ -724,6 +724,10 @@ SEARCH_BASE_COL_W = 1340     # 横版 3 列时的基准列宽（字号以此为�
 SEARCH_JPEG_QUALITY = 92     # 输出 JPEG 质量（配合 4:4:4 采样，文字清晰且体积小）
 SEARCH_IMG_EXT = ".jpg"      # 输出文件后缀（JPEG 编码速度与体积远优于 PNG）
 HELP_COLUMNS = 3             # 帮助图列数
+VIDEO_COLUMNS = 5            # B 站视频列表图横版列数（5 列 × 5 行 = 每页 25 条）
+# 视频列表图背景直接透出（不叠任何蒙版/玻璃层），文字靠自适应配色 + 描边保证可读
+VIDEO_BG_DARKEN = 170        # 背景压暗强度（与点歌搜索图一致）
+VIDEO_THUMB_ALPHA = 205      # 视频封面透明度（255=不透明；略透可让背景透出一点）
 HELP_IMG_EXT = ".jpg"        # 帮助图输出后缀
 # 帮助图背景额外压暗比例（0~1，越大背景越"实"、文字越清晰；0 表示不额外压暗）
 # 帮助图条目多、字号小，背景（尤其是随机照片）透出来会明显影响阅读，故单独加深
@@ -1207,10 +1211,12 @@ def draw_playlist_usage_image(items: List[Dict], total_size: int, total_files: i
 
 # ==================== 帮助图片 ====================
 def draw_help_image(music_root: str = MUSIC_ROOT, size: Optional[tuple] = None,
-                    bg_path: Optional[str] = None) -> BytesIO:
+                    bg_path: Optional[str] = None,
+                    bili_enabled: bool = False) -> BytesIO:
     """绘制使用帮助图片
 
     size: (宽, 高)，默认 4320x2236；bg_path: 背景图路径，默认插件 assets/bg_help.png。
+    bili_enabled: 是否展示「B站视频」分区（由插件配置决定）。
     """
     sections = [
         ("点歌播放", [
@@ -1218,6 +1224,16 @@ def draw_help_image(music_root: str = MUSIC_ROOT, size: Optional[tuple] = None,
             ("/选歌 序号", "播放搜索结果中的第 N 首"),
             ("/选歌 序号 添加歌单 歌单名", "把搜索到的歌曲下载到本地歌单"),
         ]),
+    ]
+
+    # 开启 B 站视频功能时，追加对应分区（紧随点歌播放）
+    if bili_enabled:
+        sections.insert(1, ("B站视频", [
+            ("/选歌 序号 搜索视频", "按播放量搜索该歌曲的 B 站视频"),
+            ("序号", "直接发送对应的 B 站视频文件（如 5）"),
+        ]))
+
+    sections += [
         ("本地歌单", [
             ("/创建歌单 歌单名", f"在 {music_root} 下新建歌单文件夹"),
             ("/歌单列表", "列出全部歌单文件夹"),
@@ -1563,3 +1579,218 @@ def draw_binding_image(playlist_name: str, members: List[Dict]) -> BytesIO:
     img.save(output, format='PNG')
     output.seek(0)
     return output
+
+
+# ==================== B 站视频列表图片 ====================
+def _format_play_count(value) -> str:
+    """播放量格式化（万 / 亿）"""
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return "0"
+    if num >= 100000000:
+        return f"{num / 100000000:.1f}亿"
+    if num >= 10000:
+        return f"{num / 10000:.1f}万"
+    return str(num)
+
+
+def _format_duration(seconds) -> str:
+    """秒数格式化为 mm:ss / h:mm:ss"""
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return "00:00"
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _rounded_thumb(cover: Optional[Image.Image], w: int, h: int,
+                   radius: int, fill: tuple, alpha: int = 255) -> Image.Image:
+    """把封面中心裁切为 w×h 的圆角缩略图；cover 为空时返回纯色圆角占位
+
+    alpha < 255 时整体半透明（让背景透出一点，形成轻微"玻璃"感）。
+    """
+    if cover is None:
+        base = Image.new('RGB', (w, h), fill)
+    else:
+        im = cover.convert('RGB')
+        sw, sh = im.size
+        if sw <= 0 or sh <= 0:
+            base = Image.new('RGB', (w, h), fill)
+        else:
+            target = w / h
+            if sw / sh > target:
+                new_w = max(1, int(sh * target))
+                left = (sw - new_w) // 2
+                im = im.crop((left, 0, left + new_w, sh))
+            else:
+                new_h = max(1, int(sw / target))
+                top = (sh - new_h) // 2
+                im = im.crop((0, top, sw, top + new_h))
+            base = im.resize((w, h), Image.LANCZOS)
+    mask = Image.new('L', (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        [0, 0, w - 1, h - 1], radius=radius, fill=255
+    )
+    out = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    out.paste(base, (0, 0), mask)
+    if alpha < 255:
+        a = max(0, min(255, int(alpha)))
+        out.putalpha(out.getchannel('A').point(lambda v: v * a // 255))
+    return out
+
+
+def draw_bilibili_videos_image(keyword: str, videos: List[Dict],
+                               cover_map: Optional[Dict] = None,
+                               size: Optional[tuple] = None,
+                               bg_path: Optional[str] = None,
+                               per_page: int = 25) -> List[BytesIO]:
+    """
+    绘制 B 站视频候选列表图（供「视频N」选择发送）。
+
+    每页最多 per_page 条（默认 25，即 5×5），超出自动分页，返回按页顺序的多张图片。
+    背景与分辨率由「视频列表图」独立后台配置决定（随机背景 / 后台上传背景 / 内置背景），
+    列数与字号随画布宽高比自适应，竖屏自动减列。
+    videos: [{"bvid","title","author","play","duration"}]，建议已按播放量降序（序号为全局序号）
+    cover_map: {bvid: PIL.Image}，可选；缺失的条目用纯色占位封面
+    """
+    cover_map = cover_map or {}
+    per_page = max(1, per_page)
+    bg = bg_path or SEARCH_BG_PATH
+    W, H = size or _bg_canvas_size(bg) or (SEARCH_IMG_W, SEARCH_IMG_H)
+    cols = _pick_columns(W, H, VIDEO_COLUMNS)
+    rows = max(1, (per_page + cols - 1) // cols)
+
+    # 版式基准按画布宽/高比例换算（横版 4320x2236 时与原版式一致）
+    pw, ph = W / SEARCH_IMG_W, H / SEARCH_IMG_H
+    pad_x = _scale(90, pw)
+    title_h = _scale(210, ph)
+    footer_h = _scale(150, ph)
+    col_gap = _scale(50, pw)
+    row_gap = _scale(28, ph)
+    col_w = (W - pad_x * 2 - col_gap * (cols - 1)) // cols
+    body_h = H - title_h - footer_h
+    cell_h = (body_h - row_gap * (rows - 1)) // rows
+    # 缩放系数按「每列宽度」决定：列越宽 → 文字自动放大
+    s = col_w / SEARCH_BASE_COL_W
+
+    # 背景画布只生成一次，多页复用（逐页 copy 后再绘制）
+    base = _make_canvas_with_bg(W, H, bg, darken=VIDEO_BG_DARKEN, fade=_scale(90, s))
+
+    # 背景直接透出（不加任何蒙版/玻璃层），文字靠自适应配色 + 描边保证可读
+    list_inset = _scale(40, s)
+    body_box = (list_inset, title_h, W - list_inset, H - footer_h)
+    tp, ts, td, ta, stroke_w, stroke_fill, _ = _frost_palette(base, body_box, s)
+    # 标题区也按该区域亮度自适应配色 + 描边（亮背景上不会发虚）
+    h_tp, h_ts, _, _, h_sw, h_sf, _ = _frost_palette(base, (0, 0, W, title_h), s)
+    _, f_sec, _, f_acc, f_sw, f_sf, _ = _frost_palette(
+        base, (0, H - footer_h, W, H), s
+    )
+
+    # 标题/页脚字号随画布缩放；卡片文字随列宽缩放
+    font_title = _get_font(_scale(75, pw), bold=True)
+    font_sub = _get_font(_scale(40, pw))
+    font_page = _get_font(_scale(35, pw), bold=True)
+    font_hint = _get_font(_scale(38, pw))
+    font_sign = _get_font(_scale(42, pw), bold=True)
+    name_size = _scale(52, s)
+    meta_size = _scale(38, s)
+    font_name = _get_font(name_size, bold=True)
+    font_meta = _get_font(meta_size, bold=True)
+    font_badge = _get_font(_scale(30, s), bold=True)
+
+    # 缩略图：尽量铺满单元格宽度，但高度不超过单元格的 70%（下方留给标题与元信息）
+    thumb_w = max(_scale(120, s), min(col_w, int(cell_h * 0.70 * 16 / 9)))
+    thumb_h = max(1, int(thumb_w * 9 / 16))
+    thumb_radius = max(4, _scale(12, s))
+
+    total = len(videos)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    pages: List[BytesIO] = []
+
+    for page_no in range(1, total_pages + 1):
+        page_items = videos[(page_no - 1) * per_page: page_no * per_page]
+        start_seq = (page_no - 1) * per_page
+        img = base.copy()
+        draw = ImageDraw.Draw(img)
+
+        # 标题区（自适应配色 + 描边）
+        _frost_text(draw, (pad_x, _scale(58, ph)), "B站视频", font_title,
+                    fill=h_tp, stroke=h_sw, stroke_fill=h_sf)
+        tw = _text_width(draw, "B站视频", font_title)
+        sub = _truncate_text(
+            f"「{keyword}」按播放量排序 共 {total} 个", _scale(1400, pw), font_sub, draw
+        )
+        _frost_text(draw, (pad_x + tw + _scale(36, pw), _scale(80, ph)), sub,
+                    font_sub, fill=h_ts, stroke=h_sw, stroke_fill=h_sf)
+
+        # 右上角分页胶囊
+        if total_pages > 1:
+            page_txt = f"第 {page_no} / {total_pages} 页"
+            ptw = _text_width(draw, page_txt, font_page)
+            pill_h = _scale(52, ph)
+            pill_y0 = _scale(66, ph)
+            pill_x0 = W - pad_x - ptw - _scale(44, pw)
+            draw.rounded_rectangle([pill_x0, pill_y0, W - pad_x, pill_y0 + pill_h],
+                                   radius=pill_h // 2, fill=COLOR_PRIMARY)
+            draw.text((pill_x0 + _scale(22, pw),
+                       pill_y0 + (pill_h - _scale(34, ph)) // 2),
+                      page_txt, font=font_page, fill=(255, 255, 255))
+
+        # 卡片网格
+        for k, v in enumerate(page_items):
+            cx = pad_x + (k % cols) * (col_w + col_gap)
+            cy = title_h + (k // cols) * (cell_h + row_gap)
+            seq = start_seq + k + 1
+
+            thumb_x = cx + (col_w - thumb_w) // 2
+            thumb_y = cy
+            thumb = _rounded_thumb(cover_map.get(v.get("bvid")), thumb_w, thumb_h,
+                                   thumb_radius, COLOR_CARD_BG_ALT, VIDEO_THUMB_ALPHA)
+            img.paste(thumb, (thumb_x, thumb_y), thumb)
+
+            # 缩略图左上角序号徽标
+            badge = str(seq)
+            bw = _text_width(draw, badge, font_badge) + _scale(22, s)
+            bh = _scale(40, s)
+            bx, by = thumb_x + _scale(8, s), thumb_y + _scale(8, s)
+            draw.rounded_rectangle([bx, by, bx + bw, by + bh],
+                                   radius=bh // 2, fill=COLOR_PRIMARY)
+            draw.text((bx + _scale(11, s), by + _scale(5, s)), badge,
+                      font=font_badge, fill=(255, 255, 255))
+
+            # 标题 / 元信息（宽度与缩略图对齐，行距按字号换算，避免上行压住下行）
+            text_y = thumb_y + thumb_h + _scale(14, s)
+            title = _truncate_text(
+                v.get("title", "") or "未知标题", thumb_w, font_name, draw
+            )
+            _frost_text(draw, (thumb_x, text_y), title, font_name,
+                        fill=tp, stroke=stroke_w, stroke_fill=stroke_fill)
+            meta = (f"{v.get('author', '未知UP主')}"
+                    f" · 播放 {_format_play_count(v.get('play', 0))}"
+                    f" · {_format_duration(v.get('duration', 0))}")
+            meta = _truncate_text(meta, thumb_w, font_meta, draw)
+            _frost_text(draw, (thumb_x, text_y + int(name_size * 1.35)), meta, font_meta,
+                        fill=ts, stroke=stroke_w, stroke_fill=stroke_fill)
+
+        # 底部提示 + 右下角署名（按该区域背景亮度自适应配色）
+        foot_y = H - footer_h + _scale(18, ph)
+        hint = "发送序号即可发送对应视频（如 5）"
+        if total_pages > 1:
+            hint += f"　本页序号 {start_seq + 1}-{start_seq + len(page_items)}"
+        _frost_text(draw, (pad_x, foot_y + _scale(30, ph)), hint, font_hint,
+                    fill=f_sec, stroke=f_sw, stroke_fill=f_sf)
+        sign = f"开发者:陌拜QwQ　v{PLUGIN_VERSION}"
+        sw = _text_width(draw, sign, font_sign)
+        _frost_text(draw, (W - pad_x - sw, foot_y + _scale(26, ph)), sign, font_sign,
+                    fill=f_acc, stroke=f_sw, stroke_fill=f_sf)
+
+        output = BytesIO()
+        img.save(output, format='JPEG', quality=SEARCH_JPEG_QUALITY,
+                 subsampling=0, optimize=False)
+        output.seek(0)
+        pages.append(output)
+
+    return pages

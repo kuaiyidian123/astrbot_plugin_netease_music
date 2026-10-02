@@ -13,16 +13,19 @@ import io
 import re
 import json
 import time
+import html
+import hashlib
 import asyncio
 import tempfile
 import shutil
+import urllib.parse
 from io import BytesIO
 from typing import Dict, List, Optional, Any
 
 # ============= AstrBot API =============
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
-from astrbot.api.message_components import Plain, Image, Record, File
+from astrbot.api.message_components import Plain, Image, Record, File, Video
 from astrbot.api import logger
 
 try:
@@ -43,6 +46,7 @@ from .draw import (
     draw_binding_image,
     draw_playlist_list_image,
     draw_playlist_usage_image,
+    draw_bilibili_videos_image,
     SEARCH_PAGE_SIZE,
     SEARCH_IMG_EXT,
     HELP_IMG_EXT,
@@ -56,13 +60,20 @@ DEFAULT_CONFIG = {
     "max_search_results": 100,
     "search_image_size": "",
     "help_image_size": "",
+    "video_image_size": "",
     "enable_random_bg_search": False,
     "enable_random_bg_help": False,
+    "enable_random_bg_video": False,
+    "video_random_bg_api": "",
     "random_bg_api": "https://uapis.cn/api/v1/random/image?type=pc",
     "random_bg_cache_seconds": 1800,
     "allow_unlogged_search": True,
     "audio_quality": "higher",
     "send_method": "auto",
+    "enable_bilibili_video": False,
+    "bilibili_sessdata": "",
+    "bilibili_video_max_mb": 50,
+    "bilibili_result_limit": 10,
     "http_proxy": ""
 }
 
@@ -94,6 +105,27 @@ MAX_SEARCH_LIMIT = 500                  # 单次搜索出图数量硬上限，�
 MAX_SEARCH_CACHE_ENTRIES = 50           # 搜索结果缓存条目上限，防止只搜不点导致内存堆积
 # 临时文件命名前缀（独立命名空间，避免与其它程序同前缀文件互相误删）
 TEMP_FILE_PREFIX = "netease_music_"
+
+# ============ 哔哩哔哩（B站视频搜索 / 下载） ============
+BILIBILI_API = "https://api.bilibili.com"
+BILIBILI_REFERER = "https://www.bilibili.com"
+BILIBILI_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+# WBI 签名用的字符重排表（B 站固定表，请勿修改）
+_BILI_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+    33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+    61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+    36, 20, 34, 44, 52,
+]
+WBI_KEY_TTL = 1800          # WBI 密钥缓存时长（秒）
+VIDEO_CACHE_ENTRIES = 30    # B 站视频搜索结果缓存条目上限
+BILI_RESULT_LIMIT_MAX = 100  # 单次搜索视频数量硬上限（超出按 100 处理）
+BILI_PAGE_SIZE = 25         # 视频列表图每页最多 25 条（5×5），超出自动分页
+BILI_COLUMNS = 5            # 视频列表图横版列数（5 列 × 5 行）
+BILI_VIDEO_MAX_MB_HARD = 2048  # 后台可配置的视频大小上限硬顶（MB）
 
 # 支持发送语音（Record）的平台标识，用于 send_method=auto 时显式选择发送方式
 VOICE_PLATFORMS = {
@@ -194,11 +226,62 @@ DEFAULT_HEADERS = {
 }
 
 
+def _bili_mixin_key(img_key: str, sub_key: str) -> str:
+    """由 nav 接口返回的 img_key / sub_key 计算 WBI 签名密钥"""
+    raw = f"{img_key}{sub_key}"
+    try:
+        return "".join(raw[i] for i in _BILI_MIXIN_KEY_ENC_TAB)[:32]
+    except IndexError:
+        return ""
+
+
+def _bili_wbi_sign(params: Dict, mixin_key: str) -> Dict:
+    """对请求参数做 WBI 签名，返回带 wts / w_rid 的新字典（不改动入参）"""
+    signed = dict(params)
+    signed["wts"] = int(time.time())
+    filtered = [
+        (k, "".join(ch for ch in str(v) if ch not in "!'()*"))
+        for k, v in sorted(signed.items())
+    ]
+    query = urllib.parse.urlencode(filtered)
+    signed["w_rid"] = hashlib.md5((query + mixin_key).encode("utf-8")).hexdigest()
+    return signed
+
+
+def _bili_clean_title(title: str) -> str:
+    """去掉 B 站搜索结果标题里的 <em> 高亮标签并反转义 HTML 实体"""
+    return html.unescape(re.sub(r"<[^>]+>", "", title or "")).strip()
+
+
+def _format_duration(seconds) -> str:
+    """秒数格式化为 mm:ss / h:mm:ss"""
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return "00:00"
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _format_play_count(value) -> str:
+    """播放量格式化（万 / 亿）"""
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return "0"
+    if num >= 100000000:
+        return f"{num / 100000000:.1f}亿"
+    if num >= 10000:
+        return f"{num / 10000:.1f}万"
+    return str(num)
+
+
 @register(
     "astrbot_plugin_netease_music",
     "kuaiyidian123",
     "网易云点歌插件，支持 Cookie 导入登录，搜索歌曲并返回图片列表，选择后以语音发送",
-    "1.4.9",
+    "1.5.3",
     "https://github.com/kuaiyidian123/astrbot_plugin_netease_music"
 )
 class NeteaseMusicPlugin(Star):
@@ -236,6 +319,12 @@ class NeteaseMusicPlugin(Star):
 
         self.cookie_file = os.path.join(data_dir, 'cookies.json')
         self.search_cache: Dict[str, Dict[str, Any]] = {}
+        self.video_cache: Dict[str, Dict[str, Any]] = {}  # B 站视频搜索结果缓存
+        self._bili_buvid = ""            # 匿名访问用 buvid3（获取一次后复用）
+        self._bili_buvid4 = ""           # 匿名访问用 buvid4（风控校验需要）
+        self._bili_bnut = 0              # b_nut 指纹时间戳
+        self._bili_wbi_key_cache = ""    # WBI 签名密钥缓存
+        self._bili_wbi_key_expire = 0.0  # WBI 密钥过期时间戳
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._last_temp_cleanup = 0.0  # 上次临时文件清理时间戳（节流用）
         self._session_lock = asyncio.Lock()  # 保护 HTTP 会话创建，避免并发重复建连
@@ -310,10 +399,21 @@ class NeteaseMusicPlugin(Star):
             bg_path = _resolve_config_image(self.config.get("help_bg_image"), self.data_dir)
         return size, bg_path
 
+    async def _get_video_image_options(self):
+        """B 站视频列表图 (分辨率, 背景图路径)，背景优先级同搜索结果图
+
+        与点歌结果图/帮助图各自独立：开关、缓存文件、背景图互不影响。
+        """
+        size = parse_image_size(self.config.get("video_image_size"))
+        bg_path = await self._get_random_bg_path("video")
+        if not bg_path:
+            bg_path = _resolve_config_image(self.config.get("video_bg_image"), self.data_dir)
+        return size, bg_path
+
     # ==================== 随机背景图 ====================
 
     def _random_bg_cache_path(self, kind: str) -> str:
-        """随机背景图的本地缓存文件路径（search / help 各自独立）"""
+        """随机背景图的本地缓存文件路径（search / help / video 各自独立）"""
         return os.path.join(self.data_dir, f"random_bg_{kind}.jpg")
 
     async def _download_random_bg(self, api: str) -> Optional[bytes]:
@@ -341,13 +441,22 @@ class NeteaseMusicPlugin(Star):
     async def _get_random_bg_path(self, kind: str) -> Optional[str]:
         """获取随机背景图并缓存为本地文件，返回其绝对路径
 
-        kind: 'search' 或 'help'，两者开关与缓存均独立，因此可分别控制、背景互不相同。
+        kind: 'search' / 'help' / 'video'，三者开关与缓存均独立，因此可分别控制、背景互不相同。
         未开启随机图、接口异常或图片无法解析时返回 None（由调用方回退到固定背景图）。
         """
-        switch_key = "enable_random_bg_search" if kind == "search" else "enable_random_bg_help"
+        switch_key = {
+            "search": "enable_random_bg_search",
+            "help": "enable_random_bg_help",
+            "video": "enable_random_bg_video",
+        }.get(kind, "enable_random_bg_search")
         if not self.config.get(switch_key, False):
             return None
-        api = str(self.config.get("random_bg_api") or "").strip()
+        # 视频列表图可单独指定随机图接口；留空则沿用通用接口
+        api = ""
+        if kind == "video":
+            api = str(self.config.get("video_random_bg_api") or "").strip()
+        if not api:
+            api = str(self.config.get("random_bg_api") or "").strip()
         if not api:
             return None
         try:
@@ -485,7 +594,10 @@ class NeteaseMusicPlugin(Star):
             size, bg_path = await self._get_help_image_options()
 
             def _draw():
-                return draw_help_image(_get_music_root(self.config), size=size, bg_path=bg_path)
+                return draw_help_image(
+                    _get_music_root(self.config), size=size, bg_path=bg_path,
+                    bili_enabled=self._bili_video_enabled()
+                )
 
             image_io = await asyncio.get_running_loop().run_in_executor(None, _draw)
             image_path = self._bytes_to_tempfile(
@@ -555,6 +667,7 @@ class NeteaseMusicPlugin(Star):
             expire_minutes = self.config.get("search_cache_expire_minutes", 10)
             self.search_cache[session_key] = {
                 'expire_time': time.time() + expire_minutes * 60,
+                'created_at': time.time(),
                 'songs': [
                     {
                         'id': s.get('id'),
@@ -607,16 +720,43 @@ class NeteaseMusicPlugin(Star):
         async for result in self._do_select(event, text):
             yield result
 
-    @filter.regex(r"^\d+(?:\s+添加歌单\s+.+)?$")
+    @filter.regex(r"^\d+(?:\s+添加歌单\s+.+|\s+搜索视频)?$")
     async def cmd_select_plain(self, event: AstrMessageEvent):
-        """快捷选歌：搜索后直接发「序号」，或「序号 添加歌单 歌单名」
+        """快捷选择：搜索后直接发「序号」点播歌曲；搜视频后直接发「序号」发送视频
 
-        /序号 与裸序号都支持（唤醒前缀会被框架预先剥离，两者文本一致）。
-        仅当「当前用户自己」有未过期的搜索结果时才响应：
-        别人发的数字命中不了自己的缓存，因此不会误选，也不会有任何提示。
+        「序号 添加歌单 歌单名」「序号 搜索视频」这类带修饰的写法始终按歌曲流程处理；
+        纯序号则看「最近一次列表」：最近搜的是 B 站视频 → 发视频文件，否则 → 点播歌曲。
+        仅当「当前用户自己」有未过期缓存时才响应，别人发的数字不会误触发、也不会有提示。
         """
-        cache_data = self.search_cache.get(self._get_session_key(event))
-        if not cache_data or cache_data.get('expire_time', 0) < time.time():
+        text = event.message_str.strip()
+        session_key = self._get_session_key(event)
+        now = time.time()
+
+        # 纯序号且最近一次是「搜索视频」→ 按视频序号发送
+        if re.fullmatch(r"\d+", text) and self._bili_video_enabled():
+            video_data = self.video_cache.get(session_key)
+            song_data = self.search_cache.get(session_key)
+            video_fresh = bool(video_data) and video_data.get('expire_time', 0) >= now
+            song_fresh = bool(song_data) and song_data.get('expire_time', 0) >= now
+            if video_fresh and (
+                not song_fresh
+                or video_data.get('created_at', 0) > song_data.get('created_at', 0)
+            ):
+                index = int(text)
+                videos = video_data.get('videos', [])
+                if 1 <= index <= len(videos):
+                    async for result in self._do_send_video(event, index):
+                        yield result
+                    return
+                # 越界：带唤醒前缀才提示，裸数字静默
+                if event.is_at_or_wake_command:
+                    yield event.plain_result(
+                        f"⚠️ 序号 {index} 超出范围，当前只有 {len(videos)} 个视频。"
+                    )
+                return
+
+        cache_data = self.search_cache.get(session_key)
+        if not cache_data or cache_data.get('expire_time', 0) < now:
             # 带唤醒前缀（如 /1）属于明确指令，给个提示；裸数字静默，避免打扰群聊
             if event.is_at_or_wake_command:
                 yield event.plain_result(
@@ -625,19 +765,20 @@ class NeteaseMusicPlugin(Star):
             return
         # 裸数字（非唤醒）越界时静默返回，避免群里闲聊数字被回一条报错
         if not event.is_at_or_wake_command:
-            m = re.match(r'^(\d+)', event.message_str.strip())
+            m = re.match(r'^(\d+)', text)
             if m and not (1 <= int(m.group(1)) <= len(cache_data.get('songs', []))):
                 return
-        async for result in self._do_select(event, event.message_str.strip()):
+        async for result in self._do_select(event, text):
             yield result
 
     async def _do_select(self, event: AstrMessageEvent, text: str):
-        """选歌公共实现：text 为「序号」或「序号 添加歌单 歌单名」"""
+        """选歌公共实现：text 为「序号」「序号 添加歌单 歌单名」或「序号 搜索视频」"""
         self._clean_expired_cache()
 
-        # 解析：可能是 "序号" 或 "序号 添加歌单 歌单名称"
+        # 解析：可能是 "序号"、"序号 添加歌单 歌单名称"、"序号 搜索视频"
         parts = text.split(None, 2)
         download_playlist = None
+        search_video = False
 
         if len(parts) >= 3 and parts[1] == "添加歌单":
             try:
@@ -646,6 +787,13 @@ class NeteaseMusicPlugin(Star):
                 yield event.plain_result("⚠️ 用法：/选歌 序号 或 /选歌 序号 添加歌单 歌单名")
                 return
             download_playlist = parts[2].strip()
+        elif len(parts) == 2 and parts[1].strip() == "搜索视频":
+            try:
+                index = int(parts[0])
+            except ValueError:
+                yield event.plain_result("⚠️ 用法：/选歌 序号 搜索视频")
+                return
+            search_video = True
         else:
             try:
                 index = int(text)
@@ -653,7 +801,8 @@ class NeteaseMusicPlugin(Star):
                 yield event.plain_result(
                     "⚠️ 请输入有效的歌曲序号\n"
                     "用法：/选歌 序号\n"
-                    "下载到歌单：/选歌 序号 添加歌单 歌单名"
+                    "下载到歌单：/选歌 序号 添加歌单 歌单名\n"
+                    "搜索B站视频：/选歌 序号 搜索视频"
                 )
                 return
 
@@ -686,6 +835,12 @@ class NeteaseMusicPlugin(Star):
         song_id = selected_song.get('id')
         song_name = selected_song.get('name', '未知歌曲')
         artist_name = selected_song.get('artists', [{}])[0].get('name', '未知歌手')
+
+        # ===== 搜索 B 站视频模式：不发音频，改为返回视频候选列表 =====
+        if search_video:
+            async for result in self._search_bilibili_videos(event, song_name, artist_name):
+                yield result
+            return
 
         yield event.plain_result(f"🎵 正在获取「{artist_name} - {song_name}」...")
 
@@ -801,6 +956,581 @@ class NeteaseMusicPlugin(Star):
         except Exception as e:
             logger.error(f"选歌失败: {e}")
             yield event.plain_result("❌ 选歌失败，请稍后重试")
+
+    # ==================== 指令：发送 B 站视频 ====================
+
+    @filter.regex(r"^视频\s*\d+$")
+    async def cmd_bili_video(self, event: AstrMessageEvent):
+        """发送 B 站视频（兼容写法）：「视频N」等价于直接发序号「N」"""
+        if not self._bili_video_enabled():
+            if event.is_at_or_wake_command:
+                yield event.plain_result("⚠️ B 站视频功能已被管理员关闭")
+            return
+
+        m = re.match(r"^视频\s*(\d+)$", event.message_str.strip())
+        if not m:
+            return
+        async for result in self._do_send_video(event, int(m.group(1))):
+            yield result
+
+    async def _do_send_video(self, event: AstrMessageEvent, index: int):
+        """发送视频列表中第 index 个 B 站视频文件（纯序号与「视频N」共用）"""
+        if not self._bili_video_enabled():
+            if event.is_at_or_wake_command:
+                yield event.plain_result("⚠️ B 站视频功能已被管理员关闭")
+            return
+
+        self._clean_expired_video_cache()
+        data = self.video_cache.get(self._get_session_key(event))
+        if not data or data.get('expire_time', 0) < time.time():
+            if event.is_at_or_wake_command:
+                yield event.plain_result(
+                    "❌ 未找到视频搜索结果，请先发送「/选歌 序号 搜索视频」。"
+                )
+            return
+
+        videos = data.get('videos', [])
+        if not videos:
+            yield event.plain_result("❌ 没有可发送的视频，请重新搜索。")
+            return
+        if index < 1 or index > len(videos):
+            # 裸数字场景静默（避免群里闲聊打扰），带唤醒前缀才提示
+            if event.is_at_or_wake_command:
+                yield event.plain_result(
+                    f"⚠️ 序号 {index} 超出范围，当前只有 {len(videos)} 个视频。"
+                )
+            return
+
+        video = videos[index - 1]
+        max_mb = self._bili_max_mb()
+        max_bytes = max_mb * 1024 * 1024
+        yield event.plain_result(
+            f"🎬 正在下载视频「{video.get('title', '')}」，请稍候（上限 {max_mb}MB）..."
+        )
+
+        try:
+            path, err = await self._bili_fetch_video(video, max_bytes)
+        except Exception as e:
+            logger.error(f"B 站视频下载异常: {e}")
+            path, err = None, "❌ 视频下载失败，请稍后重试"
+
+        if not path:
+            yield event.plain_result(self._bili_link_fallback(video, err))
+            return
+
+        try:
+            if os.path.getsize(path) > max_bytes:
+                self._remove_tempfile(path)
+                yield event.plain_result(self._bili_link_fallback(
+                    video, f"⚠️ 视频超过 {max_mb}MB 上限，改为发送链接"
+                ))
+                return
+            yield event.chain_result([Video(file=path)])
+            self._schedule_tempfile_cleanup(path, delay=600)
+        except OSError as e:
+            self._remove_tempfile(path)
+            yield event.plain_result(self._err_msg(e, "发送视频"))
+
+    @staticmethod
+    def _bili_link_fallback(video: Dict, reason: Optional[str]) -> str:
+        """下载失败/超出大小上限时的兜底文案：说明原因并附视频链接"""
+        return (
+            f"{reason or '❌ 无法发送该视频'}\n"
+            f"🎬 {video.get('title', '')}\n"
+            f"🔗 https://www.bilibili.com/video/{video.get('bvid', '')}"
+        )
+
+    def _bili_video_enabled(self) -> bool:
+        return bool(self.config.get("enable_bilibili_video", False))
+
+    def _bili_max_mb(self) -> int:
+        """单视频大小上限（MB），后台可配置，越界自动夹紧"""
+        try:
+            mb = int(self.config.get("bilibili_video_max_mb", 50))
+        except (TypeError, ValueError):
+            mb = 50
+        return min(max(mb, 1), BILI_VIDEO_MAX_MB_HARD)
+
+    def _bili_result_limit(self) -> int:
+        """返回的视频候选数量（个）"""
+        try:
+            num = int(self.config.get("bilibili_result_limit", 10))
+        except (TypeError, ValueError):
+            num = 10
+        return min(max(num, 1), BILI_RESULT_LIMIT_MAX)
+
+    def _clean_expired_video_cache(self):
+        now = time.time()
+        expired = [
+            k for k, v in self.video_cache.items()
+            if v.get('expire_time', 0) < now
+        ]
+        for k in expired:
+            del self.video_cache[k]
+        # 容量上限：超出按最早过期淘汰（每项持有完整视频列表）
+        overflow = len(self.video_cache) - VIDEO_CACHE_ENTRIES
+        if overflow > 0:
+            oldest = sorted(
+                self.video_cache,
+                key=lambda k: self.video_cache[k].get('expire_time', 0)
+            )
+            for k in oldest[:overflow]:
+                del self.video_cache[k]
+
+    # ---------- B 站接口 ----------
+
+    def _bili_browser_headers(self) -> Dict[str, str]:
+        """模拟浏览器的请求头（B 站接口强校验 UA / Referer / buvid 指纹）"""
+        headers = {"User-Agent": BILIBILI_UA, "Referer": BILIBILI_REFERER}
+        cookie = []
+        if self._bili_buvid:
+            cookie.append(f"buvid3={self._bili_buvid}")
+        if self._bili_buvid4:
+            cookie.append(f"buvid4={self._bili_buvid4}")
+        if self._bili_bnut:
+            cookie.append(f"b_nut={self._bili_bnut}")
+        sessdata = (self.config.get("bilibili_sessdata") or "").strip()
+        if sessdata:
+            cookie.append(f"SESSDATA={sessdata}")
+        if cookie:
+            headers["Cookie"] = "; ".join(cookie)
+        return headers
+
+    async def _bili_ensure_buvid(self) -> None:
+        """匿名访问需携带 buvid3/buvid4 指纹，否则会被风控（返回 v_voucher）"""
+        if self._bili_buvid and self._bili_buvid4:
+            return
+        data = await self._bili_get_json("/x/frontend/finger/spi", with_cookie=False)
+        payload = (data or {}).get("data") or {}
+        if payload.get("b_3"):
+            self._bili_buvid = payload["b_3"]
+        if payload.get("b_4"):
+            self._bili_buvid4 = payload["b_4"]
+        if self._bili_buvid and not self._bili_bnut:
+            self._bili_bnut = int(time.time())
+
+    async def _bili_get_json(self, path: str, params: Optional[Dict] = None,
+                             need_wbi: bool = False,
+                             with_cookie: bool = True) -> Optional[Dict]:
+        """GET 调用 B 站接口，可选 WBI 签名与浏览器 Cookie"""
+        try:
+            if with_cookie:
+                await self._bili_ensure_buvid()
+            session = await self._get_http_session()
+            query = dict(params or {})
+            if need_wbi:
+                mixin = await self._bili_wbi_key()
+                if not mixin:
+                    return None
+                query = _bili_wbi_sign(query, mixin)
+            headers = (self._bili_browser_headers() if with_cookie
+                       else {"User-Agent": BILIBILI_UA})
+            async with session.get(
+                f"{BILIBILI_API}{path}",
+                params=query,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+                proxy=self._get_proxy(),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"B 站接口 {path} 返回状态码 {resp.status}")
+                    return None
+                return await resp.json(content_type=None)
+        except Exception as e:
+            logger.error(f"B 站接口 {path} 请求失败: {e}")
+            return None
+
+    async def _bili_wbi_key(self) -> str:
+        """获取并缓存 WBI 签名密钥（nav 接口无需登录即可返回）"""
+        now = time.time()
+        if self._bili_wbi_key_cache and now < self._bili_wbi_key_expire:
+            return self._bili_wbi_key_cache
+        data = await self._bili_get_json("/x/web-interface/nav")
+        wbi = ((data or {}).get("data") or {}).get("wbi_img") or {}
+        img_key = os.path.splitext(os.path.basename(wbi.get("img_url", "")))[0]
+        sub_key = os.path.splitext(os.path.basename(wbi.get("sub_url", "")))[0]
+        key = _bili_mixin_key(img_key, sub_key)
+        if key:
+            self._bili_wbi_key_cache = key
+            self._bili_wbi_key_expire = now + WBI_KEY_TTL
+        else:
+            logger.warning("获取 B 站 WBI 密钥失败（可能被风控），视频搜索将不可用")
+        return key
+
+    @staticmethod
+    def _bili_parse_duration(value) -> int:
+        """B 站时长字段可能是秒数或 "MM:SS" / "H:MM:SS"，统一转为秒"""
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value or "").strip()
+        if not text:
+            return 0
+        if text.isdigit():
+            return int(text)
+        try:
+            total = 0
+            for part in text.split(":"):
+                total = total * 60 + int(part)
+            return total
+        except ValueError:
+            return 0
+
+    async def _bili_search_videos(self, keyword: str, limit: int) -> List[Dict]:
+        """按播放量降序搜索 B 站视频（超过单页上限时自动翻页汇总）"""
+        videos: List[Dict] = []
+        seen = set()
+        page_size = max(1, min(limit, 30))
+        page = 1
+        while len(videos) < limit and page <= 10:
+            data = await self._bili_get_json(
+                "/x/web-interface/wbi/search/type",
+                {
+                    "search_type": "video",
+                    "keyword": keyword,
+                    "page": page,
+                    "page_size": page_size,
+                    "order": "click",  # 按播放量排序
+                },
+                need_wbi=True,
+            )
+            if not data or data.get("code") != 0:
+                if page == 1 and data:
+                    logger.warning(
+                        f"B 站搜索失败 code={data.get('code')} msg={data.get('message')}"
+                    )
+                break
+            results = (data.get("data") or {}).get("result") or []
+            if not results:
+                break
+            for item in results:
+                bvid = item.get("bvid")
+                if not bvid or bvid in seen:
+                    continue
+                seen.add(bvid)
+                pic = item.get("pic") or ""
+                if pic.startswith("//"):
+                    pic = "https:" + pic
+                try:
+                    play = int(item.get("play") or 0)
+                except (TypeError, ValueError):
+                    play = 0
+                videos.append({
+                    "bvid": bvid,
+                    "title": _bili_clean_title(item.get("title", "")),
+                    "author": item.get("author") or "未知UP主",
+                    "play": play,
+                    "duration": self._bili_parse_duration(item.get("duration")),
+                    "pic": pic,
+                })
+            page += 1
+
+        # 双保险：再按播放量降序排一次并截断
+        videos.sort(key=lambda v: v["play"], reverse=True)
+        return videos[:limit]
+
+    async def _bili_fetch_covers(self, videos: List[Dict]) -> Dict:
+        """并发下载 B 站视频封面，返回 {bvid: PIL.Image}；单张失败自动跳过"""
+        covers: Dict = {}
+        sem = asyncio.Semaphore(4)
+        headers = {"User-Agent": BILIBILI_UA, "Referer": BILIBILI_REFERER}
+
+        async def _one(video: Dict):
+            bvid = video.get("bvid")
+            pic = video.get("pic") or ""
+            if not bvid or not pic:
+                return None
+            async with sem:
+                try:
+                    session = await self._get_http_session()
+                    async with session.get(
+                        pic, headers=headers, timeout=8,
+                        proxy=self._get_proxy(), allow_redirects=True,
+                    ) as resp:
+                        if resp.status != 200:
+                            return None
+                        # 流式累加限流，避免异常响应撑爆内存
+                        if (resp.content_length or 0) > MAX_COVER_BYTES:
+                            return None
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            buf.extend(chunk)
+                            if len(buf) > MAX_COVER_BYTES:
+                                return None
+                        data = bytes(buf)
+                    return (bvid, PILImage.open(BytesIO(data)).convert('RGB'))
+                except Exception as e:
+                    logger.debug(f"B 站视频封面下载失败 {bvid}: {e}")
+                    return None
+
+        results = await asyncio.gather(*[_one(v) for v in videos])
+        for r in results:
+            if r:
+                covers[r[0]] = r[1]
+        return covers
+
+    async def _search_bilibili_videos(self, event: AstrMessageEvent,
+                                      song_name: str, artist_name: str):
+        """选歌后搜索 B 站视频：渲染候选列表并缓存，供「视频N」使用"""
+        if not self._bili_video_enabled():
+            yield event.plain_result("⚠️ B 站视频搜索功能已被管理员关闭")
+            return
+
+        self._clean_expired_video_cache()
+        limit = self._bili_result_limit()
+        keyword = f"{song_name} {artist_name}".strip()
+        yield event.plain_result(f"🔍 正在 B 站搜索「{keyword}」相关视频，请稍候...")
+
+        videos = await self._bili_search_videos(keyword, limit)
+        if not videos and artist_name:
+            # 带歌手搜不到时，退回只用歌名再搜一次
+            videos = await self._bili_search_videos(song_name, limit)
+            if videos:
+                keyword = song_name
+
+        if not videos:
+            yield event.plain_result(
+                f"😔 未在 B 站找到与「{keyword}」相关的视频，可换个关键词再试。"
+            )
+            return
+
+        expire_minutes = self.config.get("search_cache_expire_minutes", 10)
+        self.video_cache[self._get_session_key(event)] = {
+            'expire_time': time.time() + expire_minutes * 60,
+            'created_at': time.time(),
+            'keyword': keyword,
+            'videos': videos,
+        }
+
+        if self._text_mode():
+            yield event.plain_result(self._format_videos_text(keyword, videos))
+            return
+
+        try:
+            covers = await self._bili_fetch_covers(videos)
+            # 背景与分辨率使用「视频列表图」的独立配置（随机背景优先）
+            size, bg_path = await self._get_video_image_options()
+
+            def _draw():
+                return draw_bilibili_videos_image(
+                    keyword, videos, covers, size=size, bg_path=bg_path,
+                    per_page=BILI_PAGE_SIZE,
+                )
+
+            image_list = await asyncio.get_running_loop().run_in_executor(None, _draw)
+            # 每页 25 条（5×5），超出自动分成多张图依次发送
+            for page_index, image_io in enumerate(image_list, 1):
+                image_path = self._bytes_to_tempfile(
+                    image_io.getvalue(), SEARCH_IMG_EXT, f"netease_bili{page_index}"
+                )
+                yield event.image_result(image_path)
+                self._schedule_tempfile_cleanup(image_path)
+        except Exception as e:
+            logger.error(f"生成 B 站视频列表图失败: {e}")
+            yield event.plain_result(self._format_videos_text(keyword, videos))
+
+    @staticmethod
+    def _format_videos_text(keyword: str, videos: List[Dict]) -> str:
+        """B 站视频候选 → 纯文本（文本发送模式）"""
+        lines = [
+            f"🎬 B站视频「{keyword}」共 {len(videos)} 个（按播放量排序）",
+            "━━━━━━━━━━━━━━",
+        ]
+        for i, v in enumerate(videos, 1):
+            lines.append(
+                f"{i}. {v.get('title', '')}\n"
+                f"   UP主：{v.get('author', '')}"
+                f" · 播放：{_format_play_count(v.get('play', 0))}"
+                f" · 时长：{_format_duration(v.get('duration', 0))}"
+            )
+        lines.append("直接发送序号即可发送对应视频（如 5）")
+        return "\n".join(lines)
+
+    async def _bili_get_video_info(self, bvid: str) -> Optional[Dict]:
+        data = await self._bili_get_json("/x/web-interface/view", {"bvid": bvid})
+        if not data or data.get("code") != 0:
+            return None
+        info = data.get("data") or {}
+        return info if info.get("cid") else None
+
+    @staticmethod
+    def _bili_codec_rank(stream: Dict) -> int:
+        """视频编码优先序：H.264(avc) 兼容性最好，优先于 H.265(hev)/AV1"""
+        codec = (stream.get("codecs") or "").lower()
+        if codec.startswith("avc"):
+            return 0
+        if codec.startswith(("hev", "hvc")):
+            return 1
+        if codec.startswith("av01"):
+            return 2
+        return 3
+
+    @classmethod
+    def _bili_pick_streams(cls, video_streams: List[Dict], audio_streams: List[Dict],
+                           duration: int, max_bytes: int):
+        """挑选体积可控的最高画质视频流 + 常规音轨，返回 (视频URL, 音频URL)"""
+        vids = [s for s in video_streams if s.get("baseUrl") or s.get("base_url")]
+        if not vids:
+            return None
+        # 同一清晰度可能有多种编码，只保留兼容性最好的那种（优先 H.264）
+        by_id: Dict[int, Dict] = {}
+        for stream in vids:
+            sid = stream.get("id", 0)
+            current = by_id.get(sid)
+            if current is None or cls._bili_codec_rank(stream) < cls._bili_codec_rank(current):
+                by_id[sid] = stream
+        ordered = [by_id[k] for k in sorted(by_id)]  # 清晰度从低到高
+
+        auds = [s for s in audio_streams if s.get("baseUrl") or s.get("base_url")]
+        # 音轨只用常规清晰度（64k/132k/192k），避开杜比与 Hi-Res 以免体积失控
+        preferred = [s for s in auds if s.get("id") in (30216, 30232, 30280)]
+        if preferred:
+            audio = max(preferred, key=lambda s: s.get("id", 0))
+        elif auds:
+            audio = min(auds, key=lambda s: s.get("id", 0))
+        else:
+            audio = None
+        audio_size = int(
+            (audio.get("bandwidth", 0) if audio else 0) / 8 * max(duration, 0)
+        )
+
+        chosen = ordered[0]
+        for stream in ordered:
+            est = int(stream.get("bandwidth", 0) / 8 * max(duration, 0)) + audio_size
+            if duration <= 0 or est <= max_bytes:
+                chosen = stream  # 记录满足体积上限里的最高一档
+        v_url = chosen.get("baseUrl") or chosen.get("base_url")
+        a_url = (audio.get("baseUrl") or audio.get("base_url")) if audio else None
+        return v_url, a_url
+
+    async def _bili_download_media(self, url: str, max_bytes: int) -> Optional[str]:
+        """流式下载单个媒体流到临时文件，超限或失败返回 None"""
+        if not url:
+            return None
+        path = os.path.join(
+            tempfile.gettempdir(),
+            f"{TEMP_FILE_PREFIX}bili_{int(time.time() * 1000)}_{os.getpid()}.m4s"
+        )
+        try:
+            session = await self._get_http_session()
+            async with session.get(
+                url,
+                headers=self._bili_browser_headers(),
+                timeout=aiohttp.ClientTimeout(total=180),
+                proxy=self._get_proxy(),
+                allow_redirects=True,
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"B 站媒体流返回状态码 {resp.status}")
+                    return None
+                if (resp.content_length or 0) > max_bytes:
+                    logger.warning("B 站媒体流超过大小上限，已跳过")
+                    return None
+                size = 0
+                with open(path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(256 * 1024):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            logger.warning("B 站媒体流超过大小上限，已中止")
+                            f.close()
+                            self._remove_tempfile(path)
+                            return None
+                        f.write(chunk)
+            if os.path.getsize(path) > 0:
+                return path
+            self._remove_tempfile(path)
+            return None
+        except Exception as e:
+            logger.warning(f"下载 B 站媒体流失败: {e}")
+            self._remove_tempfile(path)
+            return None
+
+    async def _bili_merge(self, video_path: str,
+                          audio_path: Optional[str]) -> Optional[str]:
+        """用 ffmpeg 把 DASH 音视频合并为 mp4（无 ffmpeg 时返回 None）"""
+        out_path = os.path.join(
+            tempfile.gettempdir(),
+            f"{TEMP_FILE_PREFIX}bili_{int(time.time() * 1000)}_{os.getpid()}.mp4"
+        )
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path]
+        if audio_path:
+            cmd += ["-i", audio_path]
+        cmd += ["-c", "copy", out_path]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+        except FileNotFoundError:
+            logger.error("未找到 ffmpeg，无法合并 B 站音视频，请安装 ffmpeg 后重试")
+            return None
+        except Exception as e:
+            logger.error(f"ffmpeg 执行失败: {e}")
+            return None
+        if proc.returncode != 0 or not os.path.isfile(out_path):
+            logger.warning(f"ffmpeg 合并失败: {str(stderr)[:300]}")
+            return None
+        return out_path
+
+    async def _bili_fetch_video(self, video: Dict, max_bytes: int) -> tuple:
+        """下载 B 站视频（DASH 音视频合并），返回 (本地路径, 错误提示)"""
+        bvid = video.get("bvid")
+        if not bvid:
+            return None, "❌ 视频信息缺失"
+        info = await self._bili_get_video_info(bvid)
+        if not info:
+            return None, "❌ 获取视频信息失败"
+
+        data = await self._bili_get_json(
+            "/x/player/wbi/playurl",
+            {
+                "bvid": bvid,
+                "cid": info.get("cid"),
+                "fnval": 16,   # DASH：音视频分离
+                "fnver": 0,
+                "fourk": 1,
+                "qn": 80,      # 请求 1080P，实际以账号权限为准
+            },
+            need_wbi=True,
+        )
+        if not data or data.get("code") != 0:
+            return None, "❌ 获取播放地址失败（部分视频需配置 SESSDATA）"
+
+        payload = data.get("data") or {}
+        dash = payload.get("dash") or {}
+        duration = int(info.get("duration") or 0)
+
+        picked = self._bili_pick_streams(
+            dash.get("video") or [], dash.get("audio") or [], duration, max_bytes
+        )
+        if not picked:
+            # 回退：服务端直接给出的合并流
+            durl = payload.get("durl") or []
+            if durl:
+                merged = await self._bili_download_media(durl[0].get("url"), max_bytes)
+                return (merged, None) if merged else (None, "❌ 视频流下载失败")
+            return None, "❌ 未找到可下载的视频流"
+
+        v_url, a_url = picked
+        v_path = None
+        a_path = None
+        out_path = None
+        try:
+            v_path = await self._bili_download_media(v_url, max_bytes)
+            if not v_path:
+                return None, "❌ 视频下载失败或超过大小上限"
+            if a_url:
+                a_path = await self._bili_download_media(a_url, max_bytes)
+            out_path = await self._bili_merge(v_path, a_path)
+            if not out_path:
+                # 无 ffmpeg 时退回无声视频，至少让用户看到画面
+                return v_path, None
+            return out_path, None
+        finally:
+            for tmp in (v_path, a_path):
+                if tmp and tmp != out_path:
+                    self._remove_tempfile(tmp)
 
     # ==================== 指令：创建歌单 ====================
 
@@ -2904,28 +3634,34 @@ class NeteaseMusicPlugin(Star):
         """是否启用「全部以文本发送」（开启后不再输出图片，改用纯文本）"""
         return bool(self.config.get("send_as_text", False))
 
-    @staticmethod
-    def _help_text() -> str:
+    def _help_text(self) -> str:
         """帮助信息纯文本版（文本发送模式与图片渲染失败时共用）"""
-        return (
-            "🎵 点歌指令表\n"
-            "搜索后直接发序号（如 1）即可点播\n"
-            "━━━━━━━━━━━━\n"
-            "【点歌】/点歌 /选歌\n"
-            "【歌单】/创建歌单 /歌单列表 /歌单占用 /歌单 /补封面\n"
-            "【留言】/留言\n"
-            "【管理】/删除留言 /删除歌曲 /删除歌单\n"
-            "【绑定】/绑定 /绑定邀请 /同意绑定 /绑定查看 /解绑\n"
-            "【账号】/导入cookie /查看cookie /清除cookie\n"
-            "━━━━━━━━━━━━\n"
-            "【示例】\n"
-            "听歌：/点歌 晴天 → 再发 1\n"
-            "建歌单：/创建歌单 我的歌单\n"
-            "存歌到歌单：/点歌 晴天 → 再发 1 添加歌单 我的歌单\n"
-            "听歌单里的歌：/歌单 我的歌单 → 再发 1\n"
-            "给歌留言：/留言 我的歌单 1 这首歌真好听\n"
-            "登录会员：/导入cookie"
-        )
+        lines = [
+            "🎵 点歌指令表",
+            "搜索后直接发序号（如 1）即可点播",
+            "━━━━━━━━━━━━",
+            "【点歌】/点歌 /选歌",
+            "【歌单】/创建歌单 /歌单列表 /歌单占用 /歌单 /补封面",
+            "【留言】/留言",
+            "【管理】/删除留言 /删除歌曲 /删除歌单",
+            "【绑定】/绑定 /绑定邀请 /同意绑定 /绑定查看 /解绑",
+            "【账号】/导入cookie /查看cookie /清除cookie",
+        ]
+        if self._bili_video_enabled():
+            lines.append("【视频】/选歌 序号 搜索视频 → 再发序号")
+        lines += [
+            "━━━━━━━━━━━━",
+            "【示例】",
+            "听歌：/点歌 晴天 → 再发 1",
+            "建歌单：/创建歌单 我的歌单",
+            "存歌到歌单：/点歌 晴天 → 再发 1 添加歌单 我的歌单",
+            "听歌单里的歌：/歌单 我的歌单 → 再发 1",
+            "给歌留言：/留言 我的歌单 1 这首歌真好听",
+            "登录会员：/导入cookie",
+        ]
+        if self._bili_video_enabled():
+            lines.append("看B站视频：/点歌 歌名 → 再发 1 搜索视频 → 再发 5")
+        return "\n".join(lines)
 
     @staticmethod
     def _format_search_text(keyword: str, songs: List[Dict]) -> str:

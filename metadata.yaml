@@ -1,6 +1,6 @@
 name: astrbot_plugin_netease_music
 display_name: 网易云点歌
-version: 1.4.9
+version: 1.5.3
 author: kuaiyidian123
 repo: https://github.com/kuaiyidian123/astrbot_plugin_netease_music
 desc: |
@@ -13,6 +13,7 @@ desc: |
   - 🎙️ 选择歌曲后以语音消息发送到聊天
   - 💬 歌曲留言与歌单绑定权限管理
   - 🖼️ 支持纯文本发送模式（send_as_text）
+  - 🎬 可选开启 B 站视频搜索：选歌时「搜索视频」→ 再发序号直接把视频文件发到聊天
 
   ## 指令说明
   在聊天中发送 /点歌帮助 查看完整指令列表，或查阅 README。
