@@ -1,5 +1,10 @@
 # 更新日志
 
+## v1.6.1
+
+### 🐛 修复
+- **合规修复**：`draw.py` 移除 `from astrbot.api import logger` 失败时回退标准库 `logging` 的分支，统一为只从 `astrbot.api` 导入 logger（符合插件市场上架审核对日志记录的强制要求）
+
 ## v1.6.0
 
 ### ✨ 新增

@@ -11,11 +11,7 @@ from typing import List, Dict, Optional
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageStat
 
-try:
-    from astrbot.api import logger
-except Exception:                        # 独立运行 / 单元测试时回退标准库日志
-    import logging
-    logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 
 # ==================== 颜色常量 ====================
@@ -287,7 +283,7 @@ TOTAL_WIDTH = 600
 
 # 歌单根目录（与 main.py 的 MUSIC_ROOT 一致）
 MUSIC_ROOT = r"D:\music"
-PLUGIN_VERSION = "1.6.0"  # 插件版本号（每次更新/修改递增）
+PLUGIN_VERSION = "1.6.1"  # 插件版本号（每次更新/修改递增）
 
 
 # ==================== 背景 ====================
