@@ -287,7 +287,7 @@ TOTAL_WIDTH = 600
 
 # 歌单根目录（与 main.py 的 MUSIC_ROOT 一致）
 MUSIC_ROOT = r"D:\music"
-PLUGIN_VERSION = "1.5.4"  # 插件版本号（每次更新/修改递增）
+PLUGIN_VERSION = "1.6.0"  # 插件版本号（每次更新/修改递增）
 
 
 # ==================== 背景 ====================
@@ -841,12 +841,16 @@ def _paste_round_cover(base: Image.Image, cover: Optional[Image.Image],
 def _draw_search_page(keyword: str, page_songs: List[Dict], cover_map: Dict,
                       start_index: int, page_no: int, total_pages: int,
                       total_count: int, size: Optional[tuple] = None,
-                      bg_path: Optional[str] = None) -> BytesIO:
-    """绘制单张横版搜索图（三列紧凑列表）
+                      bg_path: Optional[str] = None,
+                      title: str = "搜索结果",
+                      page_size: int = SEARCH_PAGE_SIZE,
+                      hint_action: str = "发送 /选歌 <序号> 点播歌曲") -> BytesIO:
+    """绘制单张横版歌曲列表图（三列紧凑列表）
 
     size: (宽, 高)；为 None（分辨率留空）时跟随背景图实际分辨率，无背景图则用默认 4320x2236。
     bg_path: 背景图路径，默认插件 assets/bg_search.png。
     列数随画布宽高比自适应（竖屏自动减列），字号按「每列宽度」等比缩放，保证换分辨率后版式一致不溢出。
+    title / page_size / hint_action：供「搜索结果」与「歌单歌曲」等不同场景复用同一版式。
     """
     bg = bg_path or SEARCH_BG_PATH
     W, H = size or _bg_canvas_size(bg) or (SEARCH_IMG_W, SEARCH_IMG_H)
@@ -863,7 +867,7 @@ def _draw_search_page(keyword: str, page_songs: List[Dict], cover_map: Dict,
     # 压暗（保证文字可读）在背景生成阶段一次完成，并被缓存复用
     img = _make_canvas_with_bg(W, H, bg, darken=170, fade=_scale(90, s))
 
-    rows_per_col = max(1, (SEARCH_PAGE_SIZE + cols - 1) // cols)
+    rows_per_col = max(1, (page_size + cols - 1) // cols)
     body_top = title_h
     row_h = (H - title_h - footer_h) // rows_per_col
 
@@ -886,8 +890,8 @@ def _draw_search_page(keyword: str, page_songs: List[Dict], cover_map: Dict,
     # 标题区
     font_title = _get_font(_scale(75, s), bold=True)
     font_sub = _get_font(_scale(40, s))
-    draw.text((pad_x, _scale(58, s)), "搜索结果", font=font_title, fill=COLOR_TEXT_PRIMARY)
-    tw = _text_width(draw, "搜索结果", font_title)
+    draw.text((pad_x, _scale(58, s)), title, font=font_title, fill=COLOR_TEXT_PRIMARY)
+    tw = _text_width(draw, title, font_title)
     sub = _truncate_text(f"「{keyword}」共 {total_count} 首", _scale(1400, s), font_sub, draw)
     draw.text((pad_x + tw + _scale(36, s), _scale(80, s)), sub,
               font=font_sub, fill=COLOR_TEXT_SECONDARY)
@@ -946,7 +950,7 @@ def _draw_search_page(keyword: str, page_songs: List[Dict], cover_map: Dict,
     foot_y = H - footer_h + _scale(18, s)
     font_hint = _get_font(_scale(38, s))
     end_index = start_index + len(page_songs)
-    hint = f"发送 /选歌 <序号> 点播歌曲　本页序号 {start_index + 1}-{end_index}"
+    hint = f"{hint_action}　本页序号 {start_index + 1}-{end_index}"
     # 页脚单独按该区域背景亮度自适应配色 + 描边，避免固定深色在亮背景上看不见
     _, f_sec, _, f_acc, f_sw, f_sf, _ = _frost_palette(img, (0, H - footer_h, W, H), s)
     _frost_text(draw, (pad_x, foot_y + _scale(30, s)), hint, font_hint,
@@ -989,6 +993,31 @@ def draw_search_result_image(
         _draw_search_page(keyword, page_songs, cover_map,
                           (pno - 1) * SEARCH_PAGE_SIZE, pno, len(pages), total,
                           size=size, bg_path=bg_path)
+        for pno, page_songs in enumerate(pages, 1)
+    ]
+
+
+def draw_playlist_songs_image(playlist_name: str, songs: List[Dict],
+                              covers: Optional[Dict] = None,
+                              size: Optional[tuple] = None,
+                              bg_path: Optional[str] = None,
+                              per_page: int = 50) -> List[BytesIO]:
+    """绘制「网易云歌单」歌曲列表图（每页 per_page 首，默认 50），返回多页图片
+
+    与搜索结果图共用同一套版式（三列、自适应），仅标题/每页数量/底部提示不同。
+    covers: {song_id: PIL.Image} 封面映射
+    """
+    per_page = max(1, per_page)
+    cover_map = covers or {}
+    pages = [songs[i:i + per_page] for i in range(0, len(songs), per_page)] or [[]]
+    total = len(songs)
+    return [
+        _draw_search_page(
+            playlist_name, page_songs, cover_map, (pno - 1) * per_page, pno,
+            len(pages), total, size=size, bg_path=bg_path,
+            title="歌单歌曲", page_size=per_page,
+            hint_action="发送序号即可发送对应歌曲",
+        )
         for pno, page_songs in enumerate(pages, 1)
     ]
 
@@ -1212,11 +1241,13 @@ def draw_playlist_usage_image(items: List[Dict], total_size: int, total_files: i
 # ==================== 帮助图片 ====================
 def draw_help_image(music_root: str = MUSIC_ROOT, size: Optional[tuple] = None,
                     bg_path: Optional[str] = None,
-                    bili_rows: Optional[list] = None) -> BytesIO:
+                    bili_rows: Optional[list] = None,
+                    playlist_rows: Optional[list] = None) -> BytesIO:
     """绘制使用帮助图片
 
     size: (宽, 高)，默认 4320x2236；bg_path: 背景图路径，默认插件 assets/bg_help.png。
     bili_rows: 「B站视频」分区的指令行；为 None/空则不展示该分区（由插件配置决定）。
+    playlist_rows: 「搜歌单」分区的指令行；为 None/空则不展示该分区（由插件配置决定）。
     """
     sections = [
         ("点歌播放", [
@@ -1226,9 +1257,11 @@ def draw_help_image(music_root: str = MUSIC_ROOT, size: Optional[tuple] = None,
         ]),
     ]
 
-    # 开启了 B 站视频功能（任一入口）时，追加对应分区（紧随点歌播放）
+    # 按开关动态追加分区（紧随点歌播放，阅读顺序：点歌 → 搜歌单 → B站视频）
+    if playlist_rows:
+        sections.append(("搜歌单", list(playlist_rows)))
     if bili_rows:
-        sections.insert(1, ("B站视频", list(bili_rows)))
+        sections.append(("B站视频", list(bili_rows)))
 
     sections += [
         ("本地歌单", [
@@ -1775,6 +1808,155 @@ def draw_bilibili_videos_image(keyword: str, videos: List[Dict],
         # 底部提示 + 右下角署名（按该区域背景亮度自适应配色）
         foot_y = H - footer_h + _scale(18, ph)
         hint = "发送序号即可发送对应视频（如 5）"
+        if total_pages > 1:
+            hint += f"　本页序号 {start_seq + 1}-{start_seq + len(page_items)}"
+        _frost_text(draw, (pad_x, foot_y + _scale(30, ph)), hint, font_hint,
+                    fill=f_sec, stroke=f_sw, stroke_fill=f_sf)
+        sign = f"开发者:陌拜QwQ　v{PLUGIN_VERSION}"
+        sw = _text_width(draw, sign, font_sign)
+        _frost_text(draw, (W - pad_x - sw, foot_y + _scale(26, ph)), sign, font_sign,
+                    fill=f_acc, stroke=f_sw, stroke_fill=f_sf)
+
+        output = BytesIO()
+        img.save(output, format='JPEG', quality=SEARCH_JPEG_QUALITY,
+                 subsampling=0, optimize=False)
+        output.seek(0)
+        pages.append(output)
+
+    return pages
+
+
+# ==================== 网易云歌单搜索结果图 ====================
+
+PLAYLIST_SEARCH_COLUMNS = 5        # 歌单搜索图列数（5 列 × 5 行 = 每页 25 个）
+PLAYLIST_SEARCH_PAGE_SIZE = 25     # 歌单搜索图每页数量
+
+
+def draw_playlist_search_image(keyword: str, playlists: List[Dict],
+                               cover_map: Optional[Dict] = None,
+                               size: Optional[tuple] = None,
+                               bg_path: Optional[str] = None,
+                               per_page: int = PLAYLIST_SEARCH_PAGE_SIZE) -> List[BytesIO]:
+    """绘制网易云歌单搜索结果图（方形封面网格，供发序号选择歌单）
+
+    每页最多 per_page 个（默认 25，即 5×5），超出自动分页，返回按页顺序的多张图片。
+    背景与分辨率由「歌单搜索结果图」独立后台配置决定（随机背景 / 后台上传背景 / 内置背景），
+    列数与字号随画布宽高比自适应，竖屏自动减列。
+    playlists: [{"id","name","track_count","creator","play_count"}]，序号为全局序号
+    cover_map: {playlist_id: PIL.Image}，可选；缺失的条目用纯色占位封面
+    """
+    cover_map = cover_map or {}
+    per_page = max(1, per_page)
+    bg = bg_path or SEARCH_BG_PATH
+    W, H = size or _bg_canvas_size(bg) or (SEARCH_IMG_W, SEARCH_IMG_H)
+    cols = _pick_columns(W, H, PLAYLIST_SEARCH_COLUMNS)
+    rows = max(1, (per_page + cols - 1) // cols)
+
+    # 版式基准按画布宽/高比例换算（与点歌搜索图、视频列表图保持一致）
+    pw, ph = W / SEARCH_IMG_W, H / SEARCH_IMG_H
+    pad_x = _scale(90, pw)
+    title_h = _scale(210, ph)
+    footer_h = _scale(150, ph)
+    col_gap = _scale(50, pw)
+    row_gap = _scale(28, ph)
+    col_w = (W - pad_x * 2 - col_gap * (cols - 1)) // cols
+    body_h = H - title_h - footer_h
+    cell_h = (body_h - row_gap * (rows - 1)) // rows
+    s = col_w / SEARCH_BASE_COL_W
+
+    base = _make_canvas_with_bg(W, H, bg, darken=VIDEO_BG_DARKEN, fade=_scale(90, s))
+
+    # 背景直接透出（不加任何蒙版/玻璃层），文字靠自适应配色 + 描边保证可读
+    list_inset = _scale(40, s)
+    body_box = (list_inset, title_h, W - list_inset, H - footer_h)
+    tp, ts, _, _, stroke_w, stroke_fill, _ = _frost_palette(base, body_box, s)
+    h_tp, h_ts, _, _, h_sw, h_sf, _ = _frost_palette(base, (0, 0, W, title_h), s)
+    _, f_sec, _, f_acc, f_sw, f_sf, _ = _frost_palette(base, (0, H - footer_h, W, H), s)
+
+    font_title = _get_font(_scale(75, pw), bold=True)
+    font_sub = _get_font(_scale(40, pw))
+    font_page = _get_font(_scale(35, pw), bold=True)
+    font_hint = _get_font(_scale(38, pw))
+    font_sign = _get_font(_scale(42, pw), bold=True)
+    name_size = _scale(52, s)
+    meta_size = _scale(38, s)
+    font_name = _get_font(name_size, bold=True)
+    font_meta = _get_font(meta_size, bold=True)
+    font_badge = _get_font(_scale(30, s), bold=True)
+
+    # 方形封面：尽量铺满列宽，但高度不超过单元格的 70%（下方留给名称与元信息）
+    thumb_w = min(col_w, max(_scale(120, s), int(cell_h * 0.70)))
+    thumb_h = thumb_w
+    thumb_radius = max(4, _scale(14, s))
+
+    total = len(playlists)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    pages: List[BytesIO] = []
+
+    for page_no in range(1, total_pages + 1):
+        page_items = playlists[(page_no - 1) * per_page: page_no * per_page]
+        start_seq = (page_no - 1) * per_page
+        img = base.copy()
+        draw = ImageDraw.Draw(img)
+
+        # 标题区（自适应配色 + 描边）
+        _frost_text(draw, (pad_x, _scale(58, ph)), "歌单搜索", font_title,
+                    fill=h_tp, stroke=h_sw, stroke_fill=h_sf)
+        tw = _text_width(draw, "歌单搜索", font_title)
+        sub = _truncate_text(f"「{keyword}」共 {total} 个", _scale(1400, pw), font_sub, draw)
+        _frost_text(draw, (pad_x + tw + _scale(36, pw), _scale(80, ph)), sub,
+                    font_sub, fill=h_ts, stroke=h_sw, stroke_fill=h_sf)
+
+        # 右上角分页胶囊
+        if total_pages > 1:
+            page_txt = f"第 {page_no} / {total_pages} 页"
+            ptw = _text_width(draw, page_txt, font_page)
+            pill_h = _scale(52, ph)
+            pill_y0 = _scale(66, ph)
+            pill_x0 = W - pad_x - ptw - _scale(44, pw)
+            draw.rounded_rectangle([pill_x0, pill_y0, W - pad_x, pill_y0 + pill_h],
+                                   radius=pill_h // 2, fill=COLOR_PRIMARY)
+            draw.text((pill_x0 + _scale(22, pw),
+                       pill_y0 + (pill_h - _scale(34, ph)) // 2),
+                      page_txt, font=font_page, fill=(255, 255, 255))
+
+        # 卡片网格
+        for k, pl in enumerate(page_items):
+            cx = pad_x + (k % cols) * (col_w + col_gap)
+            cy = title_h + (k // cols) * (cell_h + row_gap)
+            seq = start_seq + k + 1
+
+            thumb_x = cx + (col_w - thumb_w) // 2
+            thumb_y = cy
+            thumb = _rounded_thumb(cover_map.get(pl.get("id")), thumb_w, thumb_h,
+                                   thumb_radius, COLOR_CARD_BG_ALT, VIDEO_THUMB_ALPHA)
+            img.paste(thumb, (thumb_x, thumb_y), thumb)
+
+            # 封面左上角序号徽标
+            badge = str(seq)
+            bw = _text_width(draw, badge, font_badge) + _scale(22, s)
+            bh = _scale(40, s)
+            bx, by = thumb_x + _scale(8, s), thumb_y + _scale(8, s)
+            draw.rounded_rectangle([bx, by, bx + bw, by + bh],
+                                   radius=bh // 2, fill=COLOR_PRIMARY)
+            draw.text((bx + _scale(11, s), by + _scale(5, s)), badge,
+                      font=font_badge, fill=(255, 255, 255))
+
+            # 名称 / 元信息（宽度与封面中心对齐，行距按字号换算，避免上行压住下行）
+            text_y = thumb_y + thumb_h + _scale(14, s)
+            name = _truncate_text(
+                pl.get("name", "") or "未知歌单", thumb_w, font_name, draw
+            )
+            _frost_text(draw, (thumb_x, text_y), name, font_name,
+                        fill=tp, stroke=stroke_w, stroke_fill=stroke_fill)
+            meta = f"{pl.get('track_count', 0)} 首 · {pl.get('creator', '未知')}"
+            meta = _truncate_text(meta, thumb_w, font_meta, draw)
+            _frost_text(draw, (thumb_x, text_y + int(name_size * 1.35)), meta, font_meta,
+                        fill=ts, stroke=stroke_w, stroke_fill=stroke_fill)
+
+        # 底部提示 + 右下角署名（按该区域背景亮度自适应配色）
+        foot_y = H - footer_h + _scale(18, ph)
+        hint = "发送序号查看歌单歌曲；发送 序号 下载歌单 可整单下载"
         if total_pages > 1:
             hint += f"　本页序号 {start_seq + 1}-{start_seq + len(page_items)}"
         _frost_text(draw, (pad_x, foot_y + _scale(30, ph)), hint, font_hint,

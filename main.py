@@ -47,6 +47,8 @@ from .draw import (
     draw_playlist_list_image,
     draw_playlist_usage_image,
     draw_bilibili_videos_image,
+    draw_playlist_search_image,
+    draw_playlist_songs_image,
     SEARCH_PAGE_SIZE,
     SEARCH_IMG_EXT,
     HELP_IMG_EXT,
@@ -62,12 +64,16 @@ DEFAULT_CONFIG = {
     "help_image_size": "",
     "video_image_size": "",
     "search_cmd_image_size": "",
+    "playlist_image_size": "",
     "enable_random_bg_search": False,
     "enable_random_bg_help": False,
     "enable_random_bg_video": False,
     "enable_random_bg_search_cmd": False,
+    "enable_random_bg_playlist": False,
+    "enable_playlist_search": True,
     "video_random_bg_api": "",
     "search_cmd_random_bg_api": "",
+    "playlist_random_bg_api": "",
     "random_bg_api": "https://uapis.cn/api/v1/random/image?type=pc",
     "random_bg_cache_seconds": 1800,
     "allow_unlogged_search": True,
@@ -130,6 +136,14 @@ BILI_RESULT_LIMIT_MAX = 100  # 单次搜索视频数量硬上限（超出按 100
 BILI_PAGE_SIZE = 25         # 视频列表图每页最多 25 条（5×5），超出自动分页
 BILI_COLUMNS = 5            # 视频列表图横版列数（5 列 × 5 行）
 BILI_VIDEO_MAX_MB_HARD = 2048  # 后台可配置的视频大小上限硬顶（MB）
+
+# ============ 网易云歌单搜索 / 整单下载 ============
+PLAYLIST_SEARCH_LIMIT = 50          # 「/搜歌单 关键词」一次最多返回多少个歌单候选
+PLAYLIST_SONGS_PAGE_SIZE = 50       # 歌单歌曲列表图每页 50 首
+PLAYLIST_CACHE_ENTRIES = 30         # 歌单搜索结果缓存条目上限
+PLAYLIST_SONGS_CACHE_ENTRIES = 30   # 歌单歌曲列表缓存条目上限
+PLAYLIST_SONG_DETAIL_BATCH = 50     # 批量拉取歌曲详情的每批数量（接口实测稳定）
+MAX_PLAYLIST_TRACKS = 2000          # 单个歌单最多处理的歌曲数（防超大歌单拖垮流程）
 
 # 支持发送语音（Record）的平台标识，用于 send_method=auto 时显式选择发送方式
 VOICE_PLATFORMS = {
@@ -285,7 +299,7 @@ def _format_play_count(value) -> str:
     "astrbot_plugin_netease_music",
     "kuaiyidian123",
     "网易云点歌插件，支持 Cookie 导入登录，搜索歌曲并返回图片列表，选择后以语音发送",
-    "1.5.4",
+    "1.6.0",
     "https://github.com/kuaiyidian123/astrbot_plugin_netease_music"
 )
 class NeteaseMusicPlugin(Star):
@@ -324,6 +338,8 @@ class NeteaseMusicPlugin(Star):
         self.cookie_file = os.path.join(data_dir, 'cookies.json')
         self.search_cache: Dict[str, Dict[str, Any]] = {}
         self.video_cache: Dict[str, Dict[str, Any]] = {}  # B 站视频搜索结果缓存
+        self.playlist_cache: Dict[str, Dict[str, Any]] = {}        # 网易云歌单搜索结果缓存
+        self.playlist_songs_cache: Dict[str, Dict[str, Any]] = {}  # 选中歌单后的歌曲列表缓存
         self._bili_buvid = ""            # 匿名访问用 buvid3（获取一次后复用）
         self._bili_buvid4 = ""           # 匿名访问用 buvid4（风控校验需要）
         self._bili_bnut = 0              # b_nut 指纹时间戳
@@ -418,6 +434,20 @@ class NeteaseMusicPlugin(Star):
             bg_path = _resolve_config_image(self.config.get(bg_key), self.data_dir)
         return size, bg_path
 
+    async def _get_playlist_image_options(self):
+        """网易云歌单图 (分辨率, 背景图路径)
+
+        「歌单搜索图」与「歌单歌曲图」共用这一套设置，
+        背景优先级：随机图 API（开启时） > 后台上传的固定背景图 > 内置/渐变。
+        """
+        size = _resolve_image_size(self.config.get("playlist_image_size"))
+        bg_path = await self._get_random_bg_path("playlist")
+        if not bg_path:
+            bg_path = _resolve_config_image(
+                self.config.get("playlist_bg_image"), self.data_dir
+            )
+        return size, bg_path
+
     # ==================== 随机背景图 ====================
 
     def _random_bg_cache_path(self, kind: str) -> str:
@@ -449,7 +479,7 @@ class NeteaseMusicPlugin(Star):
     async def _get_random_bg_path(self, kind: str) -> Optional[str]:
         """获取随机背景图并缓存为本地文件，返回其绝对路径
 
-        kind: 'search' / 'help' / 'video' / 'cmd'，四者开关与缓存均独立，因此可分别控制、背景互不相同。
+        kind: 'search' / 'help' / 'video' / 'cmd' / 'playlist'，各自开关与缓存均独立，因此可分别控制、背景互不相同。
         未开启随机图、接口异常或图片无法解析时返回 None（由调用方回退到固定背景图）。
         """
         switch_key = {
@@ -457,13 +487,15 @@ class NeteaseMusicPlugin(Star):
             "help": "enable_random_bg_help",
             "video": "enable_random_bg_video",
             "cmd": "enable_random_bg_search_cmd",
+            "playlist": "enable_random_bg_playlist",
         }.get(kind, "enable_random_bg_search")
         if not self.config.get(switch_key, False):
             return None
-        # 视频列表图 / 「/搜视频」可分别指定随机图接口；留空则沿用通用接口
+        # 视频列表图 / 「/搜视频」/ 歌单图可分别指定随机图接口；留空则沿用通用接口
         api_key = {
             "video": "video_random_bg_api",
             "cmd": "search_cmd_random_bg_api",
+            "playlist": "playlist_random_bg_api",
         }.get(kind, "")
         api = str(self.config.get(api_key) or "").strip() if api_key else ""
         if not api:
@@ -613,10 +645,19 @@ class NeteaseMusicPlugin(Star):
             if bili_rows:
                 bili_rows.append(("序号", "直接发送对应的 B 站视频文件（如 5）"))
 
+            # 「搜歌单」分区（开关开启时展示）
+            playlist_rows = []
+            if self._playlist_search_enabled():
+                playlist_rows.append(("/搜歌单 关键词", "搜索网易云歌单，返回歌单图片"))
+                playlist_rows.append(("序号", "查看该歌单全部歌曲（每页 50 首）"))
+                playlist_rows.append(("序号 下载歌单", "把该歌单整单下载到本地歌单"))
+                playlist_rows.append(("/搜歌单 歌单链接", "按歌单分享链接查看全部歌曲"))
+                playlist_rows.append(("序号（歌曲列表）", "发送对应歌曲的音频文件"))
+
             def _draw():
                 return draw_help_image(
                     _get_music_root(self.config), size=size, bg_path=bg_path,
-                    bili_rows=bili_rows
+                    bili_rows=bili_rows, playlist_rows=playlist_rows
                 )
 
             image_io = await asyncio.get_running_loop().run_in_executor(None, _draw)
@@ -740,54 +781,96 @@ class NeteaseMusicPlugin(Star):
         async for result in self._do_select(event, text):
             yield result
 
-    @filter.regex(r"^\d+(?:\s+添加歌单\s+.+|\s+搜索视频)?$")
+    @filter.regex(r"^\d+(?:\s+添加歌单\s+.+|\s+搜索视频|\s+下载歌单)?$")
     async def cmd_select_plain(self, event: AstrMessageEvent):
-        """快捷选择：搜索后直接发「序号」点播歌曲；搜视频后直接发「序号」发送视频
+        """快捷选择：搜索后直接发「序号」；最近搜的是什么，序号就作用于什么
 
-        「序号 添加歌单 歌单名」「序号 搜索视频」这类带修饰的写法始终按歌曲流程处理；
-        纯序号则看「最近一次列表」：最近搜的是 B 站视频 → 发视频文件，否则 → 点播歌曲。
-        仅当「当前用户自己」有未过期缓存时才响应，别人发的数字不会误触发、也不会有提示。
+        「序号 添加歌单 歌单名」「序号 搜索视频」始终按点歌流程处理；
+        「序号 下载歌单」把歌单搜索结果里的第 N 个歌单整单下载到本地；
+        纯序号则看「最近一次列表」：B站视频 → 发视频文件，歌单 → 看该歌单歌曲，
+        歌单歌曲 → 发对应音频，点歌搜索 → 点播歌曲。
+        仅当「当前用户自己」有未过期缓存时才响应，且越界提示仅带唤醒前缀时给出。
         """
         text = event.message_str.strip()
         session_key = self._get_session_key(event)
         now = time.time()
 
-        # 纯序号且最近一次是「搜索视频」→ 按视频序号发送
-        if re.fullmatch(r"\d+", text) and self._bili_any_enabled():
-            video_data = self.video_cache.get(session_key)
-            song_data = self.search_cache.get(session_key)
-            video_fresh = bool(video_data) and video_data.get('expire_time', 0) >= now
-            song_fresh = bool(song_data) and song_data.get('expire_time', 0) >= now
-            if video_fresh and (
-                not song_fresh
-                or video_data.get('created_at', 0) > song_data.get('created_at', 0)
-            ):
-                index = int(text)
-                videos = video_data.get('videos', [])
-                if 1 <= index <= len(videos):
-                    async for result in self._do_send_video(event, index):
-                        yield result
-                    return
-                # 越界：带唤醒前缀才提示，裸数字静默
+        # 1) 「序号 下载歌单」→ 整单下载（作用于歌单搜索结果）
+        m_dl = re.fullmatch(r"(\d+)\s+下载歌单", text)
+        if m_dl:
+            async for result in self._download_searched_playlist(event, int(m_dl.group(1))):
+                yield result
+            return
+
+        # 2) 「序号 添加歌单 X」「序号 搜索视频」→ 始终走点歌流程
+        if re.fullmatch(r"\d+\s+添加歌单\s+.+", text) or re.fullmatch(r"\d+\s+搜索视频", text):
+            cache_data = self.search_cache.get(session_key)
+            if not cache_data or cache_data.get('expire_time', 0) < now:
                 if event.is_at_or_wake_command:
                     yield event.plain_result(
-                        f"⚠️ 序号 {index} 超出范围，当前只有 {len(videos)} 个视频。"
+                        "❌ 未找到对应的搜索结果，请先发送 /点歌 歌名 进行搜索。"
                     )
                 return
+            async for result in self._do_select(event, text):
+                yield result
+            return
 
-        cache_data = self.search_cache.get(session_key)
-        if not cache_data or cache_data.get('expire_time', 0) < now:
+        # 3) 纯序号 → 按「最近一次列表」路由
+        if not re.fullmatch(r"\d+", text):
+            return
+        index = int(text)
+        kind, data = self._latest_list_cache(session_key, now)
+        if kind is None:
             # 带唤醒前缀（如 /1）属于明确指令，给个提示；裸数字静默，避免打扰群聊
             if event.is_at_or_wake_command:
                 yield event.plain_result(
-                    "❌ 未找到对应的搜索结果，请先发送 /点歌 歌名 进行搜索。"
+                    "❌ 未找到对应的搜索结果，请先发送 /点歌 或 /搜歌单 进行搜索。"
                 )
             return
-        # 裸数字（非唤醒）越界时静默返回，避免群里闲聊数字被回一条报错
-        if not event.is_at_or_wake_command:
-            m = re.match(r'^(\d+)', text)
-            if m and not (1 <= int(m.group(1)) <= len(cache_data.get('songs', []))):
+
+        if kind == "video":
+            videos = data.get('videos', [])
+            if 1 <= index <= len(videos):
+                async for result in self._do_send_video(event, index):
+                    yield result
                 return
+            if event.is_at_or_wake_command:
+                yield event.plain_result(
+                    f"⚠️ 序号 {index} 超出范围，当前只有 {len(videos)} 个视频。"
+                )
+            return
+
+        if kind == "playlist":
+            playlists = data.get('playlists', [])
+            if 1 <= index <= len(playlists):
+                pl = playlists[index - 1]
+                async for result in self._show_playlist_songs(
+                    event, pl.get('id'), pl.get('name', '')
+                ):
+                    yield result
+                return
+            if event.is_at_or_wake_command:
+                yield event.plain_result(
+                    f"⚠️ 序号 {index} 超出范围，当前只有 {len(playlists)} 个歌单。"
+                )
+            return
+
+        if kind == "playlist_songs":
+            songs = data.get('songs', [])
+            if 1 <= index <= len(songs):
+                async for result in self._send_playlist_song(event, songs[index - 1]):
+                    yield result
+                return
+            if event.is_at_or_wake_command:
+                yield event.plain_result(
+                    f"⚠️ 序号 {index} 超出范围，当前只有 {len(songs)} 首歌曲。"
+                )
+            return
+
+        # kind == "song"：裸数字越界时静默，避免群里闲聊数字被回一条报错
+        songs = data.get('songs', [])
+        if not event.is_at_or_wake_command and not (1 <= index <= len(songs)):
+            return
         async for result in self._do_select(event, text):
             yield result
 
@@ -941,41 +1024,594 @@ class NeteaseMusicPlugin(Star):
                     yield event.plain_result(self._err_msg(e, "保存文件"))
                     return
             else:
-                # ===== 直接播放模式 =====
-                send_method = self.config.get("send_method", "auto")
-                audio_path = self._bytes_to_tempfile(
-                    audio_data, f".{audio_format}", "netease_voice"
-                )
-                if send_method == "link":
-                    yield event.plain_result(
-                        f"🎵 {artist_name} - {song_name}\n🔗 链接: {audio_url}"
-                    )
-                    self._remove_tempfile(audio_path)
-                elif send_method == "file":
-                    yield event.chain_result([File(name=os.path.basename(audio_path), file=audio_path)])
-                    self._schedule_tempfile_cleanup(audio_path)
-                else:
-                    # auto：按平台能力显式选择。发送由后续 pipeline stage 执行，
-                    # 此处 yield 不会因平台不支持语音而抛异常，故不能依赖 try/except 回退。
-                    platform = ""
-                    try:
-                        platform = (event.get_platform_name() or "").lower()
-                    except Exception:
-                        platform = ""
-                    if platform in VOICE_PLATFORMS or not platform:
-                        yield event.chain_result([Record(file=audio_path)])
-                    else:
-                        # 已知不支持语音的平台，直接发文件，避免用户「什么都没收到」
-                        yield event.chain_result(
-                            [File(name=os.path.basename(audio_path), file=audio_path)]
-                        )
-                    self._schedule_tempfile_cleanup(audio_path)
+                # ===== 直接播放模式（发送方式见 _emit_audio） =====
+                for result in self._emit_audio(
+                    event, audio_data, audio_format, audio_url, artist_name, song_name
+                ):
+                    yield result
 
             # 点播成功后作废本次搜索结果：需重新 /点歌 才能再点，避免重复点播
             self.search_cache.pop(session_key, None)
         except Exception as e:
             logger.error(f"选歌失败: {e}")
             yield event.plain_result("❌ 选歌失败，请稍后重试")
+
+    # ==================== 指令：搜索网易云歌单 ====================
+
+    def _playlist_search_enabled(self) -> bool:
+        """「/搜歌单」入口开关"""
+        return bool(self.config.get("enable_playlist_search", True))
+
+    def _emit_audio(self, event: AstrMessageEvent, audio_data: bytes, audio_format: str,
+                    audio_url: str, artist_name: str, song_name: str):
+        """按配置的发送方式产出发送结果（auto 优先语音，平台不支持时回退文件）"""
+        send_method = self.config.get("send_method", "auto")
+        audio_path = self._bytes_to_tempfile(
+            audio_data, f".{audio_format}", "netease_voice"
+        )
+        if send_method == "link":
+            yield event.plain_result(
+                f"🎵 {artist_name} - {song_name}\n🔗 链接: {audio_url}"
+            )
+            self._remove_tempfile(audio_path)
+        elif send_method == "file":
+            yield event.chain_result(
+                [File(name=os.path.basename(audio_path), file=audio_path)]
+            )
+            self._schedule_tempfile_cleanup(audio_path)
+        else:
+            # auto：按平台能力显式选择。发送由后续 pipeline stage 执行，
+            # 此处 yield 不会因平台不支持语音而抛异常，故不能依赖 try/except 回退。
+            platform = ""
+            try:
+                platform = (event.get_platform_name() or "").lower()
+            except Exception:
+                platform = ""
+            if platform in VOICE_PLATFORMS or not platform:
+                yield event.chain_result([Record(file=audio_path)])
+            else:
+                # 已知不支持语音的平台，直接发文件，避免用户「什么都没收到」
+                yield event.chain_result(
+                    [File(name=os.path.basename(audio_path), file=audio_path)]
+                )
+            self._schedule_tempfile_cleanup(audio_path)
+
+    @filter.command("搜歌单")
+    async def cmd_search_playlist(self, event: AstrMessageEvent):
+        """/搜歌单 关键词 → 搜索歌单出图；/搜歌单 歌单链接 [下载] → 查看 / 整单下载
+
+        先搜索歌单，再发序号 → 查看该歌单全部歌曲（每页 50 首）；
+        发「序号 下载歌单」→ 把该歌单整单下载到本地歌单文件夹；
+        进入歌曲列表后发序号 → 直接发送该歌曲的音频文件。
+        """
+        if not self._playlist_search_enabled():
+            yield event.plain_result("⚠️「/搜歌单」指令已被管理员关闭")
+            return
+
+        text = self._strip_command(event.message_str, "搜歌单")
+        if not text:
+            yield event.plain_result(
+                "用法：\n"
+                "/搜歌单 关键词 — 搜索网易云歌单\n"
+                "/搜歌单 歌单链接 — 查看该歌单全部歌曲\n"
+                "/搜歌单 歌单链接 下载 — 把该歌单下载到本地歌单\n"
+                "选定歌单后：发 序号 查看歌曲；发 序号 下载歌单 整单下载"
+            )
+            return
+        # 限制长度，避免超长输入拖垮请求（防 DoS）
+        if len(text) > 500:
+            text = text[:500]
+
+        # 「… 下载」/「… 下载歌单」后缀 → 整单下载
+        action = None
+        m = re.search(r"\s+下载歌单\s*$|\s+下载\s*$", text)
+        if m:
+            action = "download"
+            text = text[:m.start()].strip()
+
+        playlist_id = await self._resolve_playlist_link(text)
+        if playlist_id:
+            if action == "download":
+                async for result in self._download_playlist(event, playlist_id):
+                    yield result
+            else:
+                async for result in self._show_playlist_songs(event, playlist_id):
+                    yield result
+            return
+
+        if action == "download":
+            yield event.plain_result(
+                "⚠️ 整单下载需要歌单分享链接，用法：/搜歌单 歌单链接 下载\n"
+                "或先 /搜歌单 关键词 搜索，再发「序号 下载歌单」"
+            )
+            return
+
+        # 形如链接但解析不出歌单 id → 明确提示，避免把链接整串当作关键词去搜索
+        if re.search(r"https?://", text):
+            yield event.plain_result(
+                "⚠️ 未能从该链接解析出歌单 id\n"
+                "请使用歌单分享链接（music.163.com/playlist?id=xxx 或 163cn.tv 短链）"
+            )
+            return
+
+        async for result in self._search_playlists_and_render(event, text):
+            yield result
+
+    @staticmethod
+    def _extract_playlist_id(text: str) -> Optional[int]:
+        """从歌单链接或纯数字中提取歌单 id"""
+        if not text:
+            return None
+        m = re.search(r"[?&#]id=(\d+)", text)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"/playlist/(\d+)", text)
+        if m:
+            return int(m.group(1))
+        m = re.fullmatch(r"\s*(\d{5,})\s*", text)
+        if m:
+            return int(m.group(1))
+        return None
+
+    @staticmethod
+    def _is_netease_host(host: str) -> bool:
+        """是否为网易云相关域名（仅对这些域名跟随跳转解析歌单 id）"""
+        h = (host or "").lower().strip(".")
+        return (
+            h == "163.com" or h.endswith(".163.com")
+            or h == "163cn.tv" or h.endswith(".163cn.tv")
+            or h.endswith(".126.com")
+        )
+
+    async def _resolve_playlist_link(self, text: str) -> Optional[int]:
+        """解析歌单链接（含 163cn.tv 等短链：跟随跳转后再从最终地址取 id）
+
+        仅对网易云相关域名发起请求，避免把任意 URL 当成歌单链接去请求（SSRF）。
+        """
+        pid = self._extract_playlist_id(text)
+        if pid:
+            return pid
+        m = re.search(r"https?://\S+", text or "")
+        if not m:
+            return None
+        url = m.group(0)
+        if not self._is_netease_host(urllib.parse.urlparse(url).hostname or ""):
+            return None
+        try:
+            session = await self._get_http_session()
+            async with session.get(
+                url, headers=DEFAULT_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15),
+                proxy=self._get_proxy(), allow_redirects=True,
+            ) as resp:
+                final_url = str(resp.url)
+                body = await resp.content.read(200 * 1024)
+            for cand in (final_url, body.decode("utf-8", "ignore")):
+                pid = self._extract_playlist_id(cand)
+                if pid:
+                    return pid
+        except Exception as e:
+            logger.warning(f"解析歌单链接失败: {e}")
+        return None
+
+    async def _search_playlists(self, keyword: str, limit: int) -> List[Dict]:
+        """搜索网易云歌单，返回规范化后的列表"""
+        data = await self._api_get('/api/cloudsearch/pc', {
+            's': keyword, 'type': 1000, 'limit': limit, 'offset': 0
+        })
+        if not data or data.get('code') != 200:
+            return []
+        raw = (data.get('result') or {}).get('playlists') or []
+        playlists: List[Dict] = []
+        for p in raw[:limit]:
+            pid = p.get('id')
+            if not pid:
+                continue
+            playlists.append({
+                'id': pid,
+                'name': p.get('name') or '未知歌单',
+                'cover': p.get('coverImgUrl') or '',
+                'track_count': p.get('trackCount') or 0,
+                'creator': ((p.get('creator') or {}).get('nickname') or '未知'),
+                'play_count': p.get('playCount') or 0,
+            })
+        return playlists
+
+    async def _fetch_cover_urls(self, mapping: Dict) -> Dict:
+        """并发下载 {key: 图片URL} 的封面，返回 {key: PIL.Image}；单张失败自动跳过"""
+        covers: Dict = {}
+        sem = asyncio.Semaphore(4)
+
+        async def _one(key, url):
+            if not url:
+                return None
+            async with sem:
+                try:
+                    session = await self._get_http_session()
+                    async with session.get(
+                        str(url).replace('http://', 'https://'),
+                        headers=DEFAULT_HEADERS, timeout=8,
+                        proxy=self._get_proxy(), allow_redirects=True,
+                    ) as resp:
+                        if resp.status != 200:
+                            return None
+                        # 流式累加限流，避免异常响应撑爆内存
+                        if (resp.content_length or 0) > MAX_COVER_BYTES:
+                            return None
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            buf.extend(chunk)
+                            if len(buf) > MAX_COVER_BYTES:
+                                return None
+                        data = bytes(buf)
+                    return (key, PILImage.open(BytesIO(data)).convert('RGB'))
+                except Exception as e:
+                    logger.debug(f"封面下载失败 {key}: {e}")
+                    return None
+
+        results = await asyncio.gather(*[_one(k, u) for k, u in mapping.items()])
+        for r in results:
+            if r:
+                covers[r[0]] = r[1]
+        return covers
+
+    async def _fetch_playlist_meta_and_ids(self, playlist_id: int) -> tuple:
+        """获取歌单信息与全部歌曲 id
+
+        v6 详情接口的 trackIds 含完整歌曲列表，tracks 仅返回前 10 首，
+        因此统一以 trackIds 为准。
+        """
+        data = await self._api_get(
+            '/api/v6/playlist/detail', {'id': playlist_id, 'n': 1000}
+        )
+        pl = (data or {}).get('playlist') or {}
+        if not pl:
+            return {}, []
+        ids = [t.get('id') for t in (pl.get('trackIds') or []) if t.get('id')]
+        if not ids:
+            ids = [t.get('id') for t in (pl.get('tracks') or []) if t.get('id')]
+        if len(ids) > MAX_PLAYLIST_TRACKS:
+            ids = ids[:MAX_PLAYLIST_TRACKS]
+        return pl, ids
+
+    async def _fetch_songs_by_ids(self, ids: List[int]) -> List[Dict]:
+        """按 id 分批拉取歌曲详情（ar/al 新格式），并按歌单原顺序返回"""
+        if not ids:
+            return []
+        found: Dict[Any, Dict] = {}
+        for i in range(0, len(ids), PLAYLIST_SONG_DETAIL_BATCH):
+            chunk = ids[i:i + PLAYLIST_SONG_DETAIL_BATCH]
+            c = "[" + ",".join('{"id":%d}' % int(x) for x in chunk) + "]"
+            data = await self._api_get('/api/v3/song/detail', {'c': c})
+            for song in (data or {}).get('songs') or []:
+                found[song.get('id')] = song
+        return [found[i] for i in ids if i in found]
+
+    async def _search_playlists_and_render(self, event: AstrMessageEvent, keyword: str):
+        """搜索歌单 → 缓存 → 出图（文本模式或出图失败时回退纯文本）"""
+        yield event.plain_result(f"🔍 正在搜索歌单「{keyword}」，请稍候...")
+
+        playlists = await self._search_playlists(keyword, PLAYLIST_SEARCH_LIMIT)
+        if not playlists:
+            yield event.plain_result(
+                f"😔 未找到与「{keyword}」相关的歌单，请更换关键词试试。"
+            )
+            return
+
+        expire_minutes = self.config.get("search_cache_expire_minutes", 10)
+        self.playlist_cache[self._get_session_key(event)] = {
+            'expire_time': time.time() + expire_minutes * 60,
+            'created_at': time.time(),
+            'keyword': keyword,
+            'playlists': playlists,
+        }
+        # 写入后立即做容量/过期清理，保证缓存条数不超过上限
+        self._clean_expired_playlist_cache()
+
+        if self._text_mode():
+            yield event.plain_result(self._format_playlists_text(keyword, playlists))
+            return
+
+        try:
+            covers = await self._fetch_cover_urls(
+                {p['id']: p.get('cover') for p in playlists}
+            )
+            size, bg_path = await self._get_playlist_image_options()
+
+            def _draw():
+                return draw_playlist_search_image(
+                    keyword, playlists, covers, size=size, bg_path=bg_path
+                )
+
+            image_list = await asyncio.get_running_loop().run_in_executor(None, _draw)
+            for page_index, image_io in enumerate(image_list, 1):
+                image_path = self._bytes_to_tempfile(
+                    image_io.getvalue(), SEARCH_IMG_EXT, f"netease_pl{page_index}"
+                )
+                yield event.image_result(image_path)
+                self._schedule_tempfile_cleanup(image_path)
+        except Exception as e:
+            logger.error(f"生成歌单搜索图失败: {e}")
+            yield event.plain_result(self._format_playlists_text(keyword, playlists))
+
+    async def _show_playlist_songs(self, event: AstrMessageEvent, playlist_id: int,
+                                   playlist_name: str = ""):
+        """获取并展示某个歌单的全部歌曲（每页 50 首）"""
+        yield event.plain_result("🔍 正在获取歌单歌曲，请稍候...")
+
+        pl, ids = await self._fetch_playlist_meta_and_ids(playlist_id)
+        if not ids:
+            yield event.plain_result("😔 未获取到该歌单的歌曲（歌单可能为空或已失效）。")
+            return
+        songs = await self._fetch_songs_by_ids(ids)
+        if not songs:
+            yield event.plain_result("😔 未获取到该歌单的歌曲详情，请稍后重试。")
+            return
+
+        name = pl.get('name') or playlist_name or f"歌单{playlist_id}"
+        expire_minutes = self.config.get("search_cache_expire_minutes", 10)
+        self.playlist_songs_cache[self._get_session_key(event)] = {
+            'expire_time': time.time() + expire_minutes * 60,
+            'created_at': time.time(),
+            'playlist_id': playlist_id,
+            'playlist_name': name,
+            'songs': songs,
+        }
+        # 本方法是 playlist_songs_cache 的唯一写入点，写入后立即做容量/过期清理，
+        # 否则只翻歌单不搜索时缓存会无上限增长（新写入项过期时间最新，不会被淘汰）
+        self._clean_expired_playlist_cache()
+
+        if self._text_mode():
+            yield event.plain_result(self._format_playlist_songs_text(name, songs))
+            return
+
+        try:
+            covers = await self._fetch_covers(songs)
+            size, bg_path = await self._get_playlist_image_options()
+
+            def _draw():
+                return draw_playlist_songs_image(
+                    name, songs, covers, size=size, bg_path=bg_path,
+                    per_page=PLAYLIST_SONGS_PAGE_SIZE,
+                )
+
+            image_list = await asyncio.get_running_loop().run_in_executor(None, _draw)
+            for page_index, image_io in enumerate(image_list, 1):
+                image_path = self._bytes_to_tempfile(
+                    image_io.getvalue(), SEARCH_IMG_EXT, f"netease_plsong{page_index}"
+                )
+                yield event.image_result(image_path)
+                self._schedule_tempfile_cleanup(image_path)
+        except Exception as e:
+            logger.error(f"生成歌单歌曲图失败: {e}")
+            yield event.plain_result(self._format_playlist_songs_text(name, songs))
+
+    async def _send_playlist_song(self, event: AstrMessageEvent, song: Dict):
+        """发送歌单中某一首歌的音频（发送方式与 /选歌 一致）"""
+        song_id = song.get('id')
+        song_name = song.get('name') or '未知歌曲'
+        artists = song.get('ar') or song.get('artists') or []
+        artist_name = artists[0].get('name', '未知歌手') if artists else '未知歌手'
+
+        yield event.plain_result(f"🎵 正在获取「{artist_name} - {song_name}」...")
+        try:
+            quality = QUALITY_MAP.get(
+                self.config.get("audio_quality", "higher"), "higher"
+            )
+            audio_url = await self._get_song_url(song_id, quality)
+            if not audio_url:
+                for fallback in ('standard', 'higher'):
+                    audio_url = await self._get_song_url(song_id, fallback)
+                    if audio_url:
+                        break
+            if not audio_url:
+                yield event.plain_result("❌ 该歌曲可能无法获取音频，请尝试选择其他歌曲。")
+                return
+            audio_data, audio_format = await self._download_audio(audio_url)
+            if not audio_data:
+                yield event.plain_result(
+                    f"🎵 {artist_name} - {song_name}\n❌ 音频下载失败，请稍后重试"
+                )
+                return
+            for result in self._emit_audio(
+                event, audio_data, audio_format, audio_url, artist_name, song_name
+            ):
+                yield result
+        except Exception as e:
+            logger.error(f"发送歌单歌曲失败: {e}")
+            yield event.plain_result("❌ 发送失败，请稍后重试")
+
+    def _clean_expired_playlist_cache(self):
+        """清理过期的歌单搜索/歌曲缓存，并按容量上限淘汰最早过期的条目"""
+        now = time.time()
+        for store, cap in (
+            (self.playlist_cache, PLAYLIST_CACHE_ENTRIES),
+            (self.playlist_songs_cache, PLAYLIST_SONGS_CACHE_ENTRIES),
+        ):
+            for k in [k for k, v in store.items() if v.get('expire_time', 0) < now]:
+                del store[k]
+            overflow = len(store) - cap
+            if overflow > 0:
+                oldest = sorted(store, key=lambda k: store[k].get('expire_time', 0))
+                for k in oldest[:overflow]:
+                    del store[k]
+
+    def _make_local_playlist_name(self, name: str) -> str:
+        """把网易云歌单名转成合法的本地歌单名（过滤非法字符 + 截断到 15 字符）"""
+        n = self._sanitize_filename(str(name or '').strip())
+        n = n.replace('..', '_').strip()
+        n = n[:15].strip().rstrip(' .')
+        return n or '_'
+
+    def _latest_list_cache(self, session_key: str, now: float) -> tuple:
+        """返回当前用户「最近一次」有效的列表缓存 (类型, 数据)
+
+        类型：'video'（B站视频）/ 'playlist'（歌单列表）/ 'playlist_songs'（歌单歌曲）/
+        'song'（点歌搜索）。裸序号据此路由：最近搜什么，发序号就作用于什么。
+        """
+        options = []
+        for kind, store in (
+            ("video", self.video_cache),
+            ("playlist", self.playlist_cache),
+            ("playlist_songs", self.playlist_songs_cache),
+            ("song", self.search_cache),
+        ):
+            # 入口开关已关闭时，对应缓存不再参与裸序号路由
+            if kind == "video" and not self._bili_any_enabled():
+                continue
+            if kind in ("playlist", "playlist_songs") and not self._playlist_search_enabled():
+                continue
+            data = store.get(session_key)
+            if data and data.get('expire_time', 0) >= now:
+                options.append((data.get('created_at', 0), kind, data))
+        if not options:
+            return None, None
+        options.sort(key=lambda x: x[0], reverse=True)
+        return options[0][1], options[0][2]
+
+    async def _download_searched_playlist(self, event: AstrMessageEvent, index: int):
+        """「序号 下载歌单」：按歌单搜索结果的序号整单下载"""
+        if not self._playlist_search_enabled():
+            yield event.plain_result("⚠️「/搜歌单」指令已被管理员关闭")
+            return
+        self._clean_expired_playlist_cache()
+        data = self.playlist_cache.get(self._get_session_key(event))
+        if not data or data.get('expire_time', 0) < time.time():
+            yield event.plain_result(
+                "❌ 未找到歌单搜索结果，请先发送 /搜歌单 关键词 进行搜索。"
+            )
+            return
+        playlists = data.get('playlists', [])
+        if index < 1 or index > len(playlists):
+            yield event.plain_result(
+                f"⚠️ 序号 {index} 超出范围，当前只有 {len(playlists)} 个歌单。"
+            )
+            return
+        pl = playlists[index - 1]
+        async for result in self._download_playlist(
+            event, pl.get('id'), pl.get('name', '')
+        ):
+            yield result
+
+    async def _download_playlist(self, event: AstrMessageEvent, playlist_id: int,
+                                 playlist_name: str = ""):
+        """把网易云歌单整单下载到本地歌单文件夹
+
+        本地歌单不存在时自动创建（用网易云歌单名，截断到 15 字符）并绑定发起人；
+        已存在时必须是本插件歌单，且发起人具备管理权限。
+        """
+        _off = self._feature_off_msg("playlist")
+        if _off:
+            yield event.plain_result(_off)
+            return
+
+        yield event.plain_result("🔍 正在获取歌单信息，请稍候...")
+        pl, ids = await self._fetch_playlist_meta_and_ids(playlist_id)
+        if not ids:
+            yield event.plain_result("😔 未获取到该歌单的歌曲（歌单可能为空或已失效）。")
+            return
+
+        remote_name = pl.get('name') or playlist_name or f"歌单{playlist_id}"
+        local_name = self._make_local_playlist_name(remote_name)
+        playlist_dir, pdir_err = self._resolve_playlist_dir(local_name)
+        if pdir_err:
+            yield event.plain_result(pdir_err)
+            return
+
+        # 先取歌曲详情再创建本地目录：避免详情拉取失败时残留一个空的已绑定歌单
+        songs = await self._fetch_songs_by_ids(ids)
+        if not songs:
+            yield event.plain_result("😔 未获取到该歌单的歌曲详情，请稍后重试。")
+            return
+
+        if not os.path.isdir(playlist_dir):
+            try:
+                os.makedirs(playlist_dir, exist_ok=False)
+            except OSError as e:
+                yield event.plain_result(self._err_msg(e, "创建歌单"))
+                return
+            self._mark_playlist_dir(playlist_dir)
+            # 自动把发起人绑定为歌单主，便于后续管理
+            self._save_binding(playlist_dir, {
+                'owner': {'user_id': self._get_user_id(event),
+                          'name': self._get_user_name(event)},
+                'members': [], 'pending': [],
+            })
+        else:
+            marker_err = self._require_plugin_playlist(local_name, playlist_dir)
+            if marker_err:
+                yield event.plain_result(marker_err)
+                return
+            denied = self._check_admin(local_name, playlist_dir, event)
+            if denied:
+                yield event.plain_result(denied)
+                return
+
+        total = len(songs)
+        yield event.plain_result(
+            f"🎵 歌单「{remote_name}」共 {total} 首\n"
+            f"开始下载到本地歌单「{local_name}」，请稍候..."
+        )
+
+        ok = skip = fail = 0
+        for i, song in enumerate(songs, 1):
+            status = await self._download_one_song_to_dir(song, playlist_dir)
+            if status == 'ok':
+                ok += 1
+            elif status == 'skip':
+                skip += 1
+            else:
+                fail += 1
+            if i % 20 == 0 and i < total:
+                yield event.plain_result(
+                    f"⏳ 下载中… {i}/{total}（成功 {ok}，跳过 {skip}，失败 {fail}）"
+                )
+
+        yield event.plain_result(
+            f"✅ 歌单「{remote_name}」下载完成\n"
+            f"📁 本地歌单：{local_name}\n"
+            f"成功 {ok} 首，跳过 {skip} 首（已存在），失败 {fail} 首"
+        )
+
+    async def _download_one_song_to_dir(self, song: Dict, playlist_dir: str) -> str:
+        """下载单曲到指定歌单目录，返回 'ok' / 'skip'（已存在）/ 'fail'"""
+        song_id = song.get('id')
+        if not song_id:
+            return 'fail'
+        name = song.get('name') or '未知歌曲'
+        artists = song.get('ar') or song.get('artists') or []
+        artist = artists[0].get('name', '未知歌手') if artists else '未知歌手'
+        safe_name = self._sanitize_filename(f"{artist} - {name}")
+
+        # 已存在任意音频后缀则跳过，避免大歌单重复下载
+        for ext in ('mp3', 'm4a', 'flac', 'aac', 'wav', 'ogg'):
+            if os.path.exists(os.path.join(playlist_dir, f"{safe_name}.{ext}")):
+                return 'skip'
+
+        try:
+            quality = QUALITY_MAP.get(
+                self.config.get("audio_quality", "higher"), "higher"
+            )
+            audio_url = await self._get_song_url(song_id, quality)
+            if not audio_url:
+                for fallback in ('standard', 'higher'):
+                    audio_url = await self._get_song_url(song_id, fallback)
+                    if audio_url:
+                        break
+            if not audio_url:
+                return 'fail'
+            audio_data, audio_format = await self._download_audio(audio_url)
+            if not audio_data:
+                return 'fail'
+            save_path = os.path.join(playlist_dir, f"{safe_name}.{audio_format}")
+            with open(save_path, 'wb') as f:
+                f.write(audio_data)
+            # 封面自动保存到歌单文件夹（渲染歌单图时直接读本地）
+            await self._save_song_cover(song, playlist_dir, safe_name)
+            return 'ok'
+        except Exception as e:
+            logger.warning(f"下载歌曲失败 {song_id}: {e}")
+            return 'fail'
 
     # ==================== 指令：搜索 / 发送 B 站视频 ====================
 
@@ -3714,6 +4350,8 @@ class NeteaseMusicPlugin(Star):
             lines.append("【视频】选歌时加「搜索视频」（如 1 搜索视频）→ 再发序号")
         if self._bili_search_cmd_enabled():
             lines.append("【视频】/搜视频 关键词 → 再发序号")
+        if self._playlist_search_enabled():
+            lines.append("【搜歌单】/搜歌单 关键词 或 /搜歌单 歌单链接")
         lines += [
             "━━━━━━━━━━━━",
             "【示例】",
@@ -3728,6 +4366,8 @@ class NeteaseMusicPlugin(Star):
             lines.append("搜B站视频：/搜视频 关键词 → 再发 5")
         if self._bili_video_enabled():
             lines.append("按歌搜视频：/点歌 歌名 → 再发 1 搜索视频 → 再发 5")
+        if self._playlist_search_enabled():
+            lines.append("搜/下载歌单：/搜歌单 关键词 → 再发 1 看歌曲 → 发 1 下载歌单")
         return "\n".join(lines)
 
     @staticmethod
@@ -3745,6 +4385,37 @@ class NeteaseMusicPlugin(Star):
             lines.append(f"... 共 {total} 首，仅显示前 {len(show)} 首，可缩小关键词")
         lines.append("")
         lines.append("发送 序号 点播（如 1）；发送 序号 添加歌单 歌单名 可下载到歌单")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_playlists_text(keyword: str, playlists: List[Dict]) -> str:
+        """歌单搜索结果 → 纯文本"""
+        total = len(playlists)
+        lines = [f"🎧 歌单搜索「{keyword}」共 {total} 个", "━━━━━━━━━━━━━━"]
+        for i, p in enumerate(playlists, 1):
+            lines.append(
+                f"{i}. {p.get('name', '未知歌单')}\n"
+                f"   {p.get('track_count', 0)} 首 · {p.get('creator', '未知')}"
+            )
+        lines.append("")
+        lines.append("发送 序号 查看歌单歌曲；发送 序号 下载歌单 可整单下载")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_playlist_songs_text(playlist_name: str, songs: List[Dict]) -> str:
+        """歌单歌曲 → 纯文本（最多展示 50 条，避免消息过长）"""
+        total = len(songs)
+        show = songs[:50]
+        lines = [f"🎧 歌单「{playlist_name}」共 {total} 首", "━━━━━━━━━━━━━━"]
+        for i, s in enumerate(show, 1):
+            name = s.get('name', '未知歌曲')
+            artists = s.get('ar') or s.get('artists') or []
+            artist = "/".join(a.get('name', '') for a in artists[:3]) if artists else '未知歌手'
+            lines.append(f"{i}. {name} — {artist}")
+        if total > len(show):
+            lines.append(f"... 共 {total} 首，仅显示前 {len(show)} 首")
+        lines.append("")
+        lines.append("发送 序号 即可发送对应歌曲的音频")
         return "\n".join(lines)
 
     def _format_comments_text(self, playlist_dir: str, filename: str) -> str:
