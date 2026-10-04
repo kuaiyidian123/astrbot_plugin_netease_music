@@ -276,6 +276,36 @@
     "maximum": 1000,
     "description": "每位用户每天最多生图次数，默认 5；填 0 表示不限制。生图会消耗 Anlas 额度，建议设置上限。"
   },
+  "tusi_base_url": {
+    "type": "string",
+    "title": "吐司接口地址",
+    "default": "https://cn.tensorart.net",
+    "description": "吐司（TAMS）开放接口地址。国内站为 https://cn.tensorart.net，国际站可用 https://ap-east-1.tensorart.cloud。"
+  },
+  "tusi_api_key": {
+    "type": "string",
+    "title": "吐司 API Key",
+    "default": "",
+    "description": "在吐司开放平台 https://tams.tusiart.com/apps 创建应用后生成的密钥。填好后即可用「/生图 吐司 中文描述」走吐司生图。"
+  },
+  "tusi_template_id": {
+    "type": "string",
+    "title": "吐司模板(ID)（必填）",
+    "default": "",
+    "description": "要使用的吐司工作流模板 ID。在吐司站点打开想用的工作流，其地址中的数字 ID 即为该值。留空则「/生图 吐司」不可用。"
+  },
+  "tusi_prompt_field": {
+    "type": "string",
+    "title": "吐司提示词字段名（可留空）",
+    "default": "",
+    "description": "模板中用于填写正向提示词的字段名。留空时自动识别（匹配含 prompt / 提示词 / 关键词 的字段）；自动识别失败时可在此手动填写。"
+  },
+  "tusi_negative_field": {
+    "type": "string",
+    "title": "吐司负面词字段名（可留空）",
+    "default": "",
+    "description": "模板中用于填写负面提示词的字段名。留空时自动识别（匹配含 negative / 负面 / 反向 的字段）；模板没有该字段时会自动跳过。"
+  },
   "music_root": {
     "type": "string",
     "title": "音乐文件夹保存位置",

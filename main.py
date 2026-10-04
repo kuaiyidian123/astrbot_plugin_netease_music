@@ -86,6 +86,32 @@ NAI_MAX_IMAGE_BYTES = 32 * 1024 * 1024  # 单次响应体上限（32MB），防�
 MAX_NAI_PROMPT_CHARS = 500         # 用户输入的描述长度上限
 
 
+# ============ 吐司（TAMS / tusi.cn）生图 ============
+TUSI_DEFAULT_BASE_URL = "https://cn.tensorart.net"
+# 模板里提示词/负面词字段的自动识别关键词（可用配置项手动指定覆盖）
+TUSI_PROMPT_KEYS = ("prompt", "提示词", "提示语", "关键词", "描述")
+TUSI_NEGATIVE_KEYS = ("negative", "负面", "反向", "负向")
+TUSI_API_TIMEOUT = 60                   # 单次接口请求超时（秒）
+TUSI_JOB_TIMEOUT = 300                  # 提交后等待作业完成的整体上限（秒）
+TUSI_POLL_INTERVAL = 4                  # 作业状态轮询间隔（秒）
+TUSI_MAX_JSON_BYTES = 2 * 1024 * 1024   # 接口 JSON 响应上限
+TUSI_MAX_IMAGE_BYTES = 32 * 1024 * 1024  # 结果图片上限
+
+
+def _split_tusi_prefix(text: str) -> tuple:
+    """识别「/生图 吐司 xxx」中的渠道前缀，返回 (是否走吐司, 剩余描述)
+
+    「吐司」后必须跟空白或分隔符才算前缀，避免「吐司面包」这类描述被误判。
+    """
+    raw = (text or "").strip()
+    m = re.match(r"^吐司(?:\s+|[,，:：]+\s*)(.+)$", raw)
+    if m:
+        return True, m.group(1).strip()
+    if raw == "吐司":
+        return True, ""
+    return False, raw
+
+
 def _parse_nai_size(value, default: tuple = (832, 1216)) -> tuple:
     """解析生图尺寸 "宽x高"（自动对齐到 64 的倍数，并限制总像素），非法时返回默认值"""
     text = str(value or "").strip().lower().replace(" ", "")
@@ -162,6 +188,11 @@ DEFAULT_CONFIG = {
     "nai_negative_extra": "",
     "nai_tag_provider": "",
     "nai_daily_limit": 5,
+    "tusi_base_url": TUSI_DEFAULT_BASE_URL,
+    "tusi_api_key": "",
+    "tusi_template_id": "",
+    "tusi_prompt_field": "",
+    "tusi_negative_field": "",
     "http_proxy": ""
 }
 
@@ -377,7 +408,7 @@ def _format_play_count(value) -> str:
     "astrbot_plugin_netease_music",
     "kuaiyidian123",
     "网易云点歌插件，支持 Cookie 导入登录，搜索歌曲并返回图片列表，选择后以语音发送",
-    "1.7.0",
+    "1.8.0",
     "https://github.com/kuaiyidian123/astrbot_plugin_netease_music"
 )
 class NeteaseMusicPlugin(Star):
@@ -738,6 +769,8 @@ class NeteaseMusicPlugin(Star):
             imagegen_rows = []
             if self._nai_enabled():
                 imagegen_rows.append(("/生图 中文描述", "AI 生成二次元插画"))
+                if self._tusi_ready():
+                    imagegen_rows.append(("/生图 吐司 描述", "改走吐司接口生图"))
                 imagegen_rows.append(("/生图帮助", "查看生图配置与可用模型 ID"))
 
             def _draw():
@@ -2607,26 +2640,241 @@ class NeteaseMusicPlugin(Star):
             logger.error(f"NovelAI 生图请求失败: {e}")
             return None, "❌ 生图请求失败，请稍后重试"
 
+    # ---------- 吐司（TAMS）接口 ----------
+
+    def _tusi_cfg(self) -> Dict[str, Any]:
+        """解析吐司（TAMS）生图配置"""
+        return {
+            "base_url": (str(self.config.get("tusi_base_url") or "").strip()
+                         or TUSI_DEFAULT_BASE_URL).rstrip("/"),
+            "api_key": str(self.config.get("tusi_api_key") or "").strip(),
+            "template_id": str(self.config.get("tusi_template_id") or "").strip(),
+            "prompt_field": str(self.config.get("tusi_prompt_field") or "").strip(),
+            "negative_field": str(self.config.get("tusi_negative_field") or "").strip(),
+        }
+
+    def _tusi_ready(self) -> bool:
+        """吐司是否已配置好（API Key 与模板 ID 都填了才可用）"""
+        cfg = self._tusi_cfg()
+        return bool(cfg["api_key"] and cfg["template_id"])
+
+    @staticmethod
+    def _pick_tusi_attr(attrs: List[Dict[str, Any]], explicit: str,
+                        keywords: tuple, exclude: tuple = ()) -> Optional[Dict[str, Any]]:
+        """在模板字段里定位目标字段：优先用配置指定的名称，否则按关键词自动识别"""
+        if explicit:
+            target = explicit.lower()
+            for attr in attrs:
+                if str(attr.get("fieldName") or "").strip() == explicit:
+                    return attr
+            for attr in attrs:
+                if target in str(attr.get("fieldName") or "").lower():
+                    return attr
+            return None
+        for attr in attrs:
+            name = str(attr.get("fieldName") or "").lower()
+            if not name:
+                continue
+            if any(k in name for k in keywords) and not any(x in name for x in exclude):
+                return attr
+        return None
+
+    @staticmethod
+    def _tusi_error_msg(status: int, body: bytes) -> str:
+        """把吐司接口错误转成可读提示"""
+        detail = ""
+        try:
+            obj = json.loads(body.decode("utf-8", "ignore"))
+            if isinstance(obj, dict):
+                detail = str(obj.get("message") or obj.get("msg") or obj.get("error") or "").strip()
+        except Exception:
+            detail = ""
+        if status == 401:
+            return "❌ 吐司 API Key 无效或已过期，请检查后台「吐司 API Key」"
+        if status == 403:
+            return "❌ 吐司拒绝访问（403），请确认该应用权限或算力余额"
+        if status == 404:
+            return "❌ 未找到该吐司模板，请检查后台「吐司模板(ID)」是否正确"
+        if status == 429:
+            return "⚠️ 吐司请求过于频繁（被限流），请稍后再试"
+        tail = f"\n{detail}" if detail else ""
+        return f"❌ 吐司生图失败（HTTP {status}）{tail}"
+
+    async def _tusi_download_image(self, session, url: str) -> tuple:
+        """下载吐司生成的结果图片，返回 (图片字节, 错误文案)"""
+        try:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=TUSI_API_TIMEOUT),
+                proxy=self._get_proxy(),
+            ) as resp:
+                if resp.status != 200:
+                    return None, f"❌ 下载吐司生成结果失败（HTTP {resp.status}）"
+                body = await self._read_capped(resp, TUSI_MAX_IMAGE_BYTES)
+                if body is None:
+                    return None, "❌ 生成结果过大，已中止接收"
+            if not body:
+                return None, "❌ 吐司生成结果为空"
+            return body, None
+        except Exception as e:
+            logger.error(f"下载吐司生成结果失败: {e}")
+            return None, "❌ 下载吐司生成结果失败，请稍后重试"
+
+    async def _tusi_wait_job(self, session, base: str, headers: Dict[str, str],
+                             job_id: str) -> tuple:
+        """轮询吐司作业直到完成，返回 (图片字节, 错误文案)"""
+        deadline = time.monotonic() + TUSI_JOB_TIMEOUT
+        while time.monotonic() < deadline:
+            await asyncio.sleep(TUSI_POLL_INTERVAL)
+            try:
+                async with session.get(
+                    f"{base}/v1/jobs/{job_id}", headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=TUSI_API_TIMEOUT),
+                    proxy=self._get_proxy(),
+                ) as resp:
+                    body = await self._read_capped(resp, TUSI_MAX_JSON_BYTES)
+                    if body is None:
+                        continue
+                    if resp.status != 200:
+                        logger.warning(f"吐司查询作业失败 HTTP {resp.status}")
+                        return None, self._tusi_error_msg(resp.status, body)
+                data = json.loads(body.decode("utf-8", "ignore")) or {}
+            except Exception as e:
+                # 单次轮询失败不致命，等下一轮继续查
+                logger.warning(f"吐司查询作业异常（将继续重试）: {e}")
+                continue
+
+            job = data.get("job") or {}
+            status = str(job.get("status") or "").upper()
+            if status == "SUCCESS":
+                images = ((job.get("successInfo") or {}).get("images")) or []
+                if not images:
+                    return None, "❌ 吐司作业已完成，但没有返回图片"
+                url = str((images[0] or {}).get("url") or "").strip()
+                if not url:
+                    return None, "❌ 吐司返回的图片地址为空"
+                return await self._tusi_download_image(session, url)
+            if status == "FAILED":
+                info = job.get("failedInfo") or job.get("message") or job.get("error") or ""
+                detail = (json.dumps(info, ensure_ascii=False)
+                          if isinstance(info, (dict, list)) else str(info))
+                detail = " ".join(detail.split())[:200]
+                logger.warning(f"吐司作业失败: {detail}")
+                return None, f"❌ 吐司生图失败{f'{chr(10)}{detail}' if detail else ''}"
+            # WAITING / RUNNING 等状态：继续等待
+        return None, "⏰ 吐司生图等待超时，请稍后重试"
+
+    async def _tusi_generate(self, positive: str, negative: str,
+                             cfg: Dict[str, Any]) -> tuple:
+        """调用吐司（TAMS）工作流模板接口生图，返回 (图片字节, 错误文案)"""
+        base = cfg["base_url"]
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        }
+        try:
+            session = await self._get_http_session()
+            # 1) 取模板参数定义（各模板字段不同，直接问接口最稳）
+            async with session.get(
+                f"{base}/v1/workflows/{cfg['template_id']}", headers=headers,
+                timeout=aiohttp.ClientTimeout(total=TUSI_API_TIMEOUT),
+                proxy=self._get_proxy(),
+            ) as resp:
+                body = await self._read_capped(resp, TUSI_MAX_JSON_BYTES)
+                if body is None:
+                    return None, "❌ 吐司模板信息过大，已中止接收"
+                if resp.status != 200:
+                    logger.warning(f"吐司取模板失败 HTTP {resp.status}")
+                    return None, self._tusi_error_msg(resp.status, body)
+            try:
+                template = json.loads(body.decode("utf-8", "ignore")) or {}
+            except Exception as e:
+                logger.warning(f"吐司模板响应解析失败: {e}")
+                return None, "❌ 吐司返回的模板信息无法解析，请检查接口地址"
+
+            attrs = [dict(a) for a in (((template.get("fields") or {}).get("fieldAttrs")) or [])]
+            if not attrs:
+                return None, "❌ 该吐司模板没有可填写的参数，请更换「吐司模板(ID)」"
+
+            prompt_attr = self._pick_tusi_attr(
+                attrs, cfg["prompt_field"], TUSI_PROMPT_KEYS, TUSI_NEGATIVE_KEYS
+            )
+            if prompt_attr is None:
+                return None, (
+                    "❌ 未能识别吐司模板中的提示词字段\n"
+                    "请在后台「吐司提示词字段名」中手动填写该字段名"
+                )
+            prompt_attr["fieldValue"] = positive
+            negative_attr = self._pick_tusi_attr(
+                attrs, cfg["negative_field"], TUSI_NEGATIVE_KEYS
+            )
+            if negative_attr is not None:
+                negative_attr["fieldValue"] = negative
+
+            # 2) 提交作业
+            payload = {
+                "requestId": hashlib.md5(
+                    f"{cfg['template_id']}{time.time()}".encode("utf-8")
+                ).hexdigest(),
+                "templateId": cfg["template_id"],
+                "fields": {"fieldAttrs": attrs},
+            }
+            async with session.post(
+                f"{base}/v1/jobs/workflow/template", json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=TUSI_API_TIMEOUT),
+                proxy=self._get_proxy(),
+            ) as resp:
+                body = await self._read_capped(resp, TUSI_MAX_JSON_BYTES)
+                if body is None:
+                    return None, "❌ 吐司返回内容过大，已中止接收"
+                if resp.status != 200:
+                    logger.warning(f"吐司提交作业失败 HTTP {resp.status}")
+                    return None, self._tusi_error_msg(resp.status, body)
+            try:
+                created = json.loads(body.decode("utf-8", "ignore")) or {}
+            except Exception as e:
+                logger.warning(f"吐司提交响应解析失败: {e}")
+                return None, "❌ 吐司提交作业失败，返回内容无法解析"
+            job_id = str(((created.get("job") or {}).get("id")) or "").strip()
+            if not job_id:
+                logger.warning(f"吐司未返回作业 ID: {str(created)[:200]}")
+                return None, "❌ 吐司未返回作业 ID，请稍后重试"
+
+            # 3) 轮询到出图
+            return await self._tusi_wait_job(session, base, headers, job_id)
+        except aiohttp.ClientConnectionError as e:
+            host = urllib.parse.urlparse(base).netloc or base
+            logger.error(f"吐司连接失败 {host}: {e}")
+            return None, (
+                f"❌ 无法连接到吐司接口：{host}\n"
+                "请检查后台「吐司接口地址」是否正确；若被网络阻断，"
+                "可在后台「HTTP 代理」填写本地代理地址。"
+            )
+        except asyncio.TimeoutError:
+            return None, "⏰ 吐司生图超时，请稍后重试"
+        except Exception as e:
+            logger.error(f"吐司生图请求失败: {e}")
+            return None, "❌ 吐司生图请求失败，请稍后重试"
+
     # ---------- 指令：/生图 ----------
 
     @filter.command("生图")
     async def cmd_image_gen(self, event: AstrMessageEvent):
-        """/生图 中文描述 → 大模型转英文绘画 tag → NovelAI 生成插画并发送"""
+        """/生图 中文描述 → 大模型转英文绘画 tag → 生图并发送
+
+        加「吐司」前缀（/生图 吐司 描述）则改走吐司（TAMS）接口。
+        """
         if not self._nai_enabled():
             yield event.plain_result("⚠️「/生图」功能已被管理员关闭")
             return
 
-        cfg = self._nai_cfg()
-        if not cfg["key"]:
-            yield event.plain_result(
-                "⚠️ 尚未配置 NovelAI API Key\n请联系管理员在后台插件配置中填写「生图 API Key」"
-            )
-            return
-
-        text = self._strip_command(event.message_str, "生图")
+        raw = self._strip_command(event.message_str, "生图")
+        use_tusi, text = _split_tusi_prefix(raw)
         if not text:
             yield event.plain_result(
                 "用法：/生图 中文描述\n"
+                "      /生图 吐司 中文描述（走吐司接口）\n"
                 "示例：/生图 蓝发少女站在樱花树下，微笑，逆光\n"
                 "查看配置与可用模型：/生图帮助"
             )
@@ -2634,7 +2882,23 @@ class NeteaseMusicPlugin(Star):
         if len(text) > MAX_NAI_PROMPT_CHARS:
             text = text[:MAX_NAI_PROMPT_CHARS]
 
-        denied = self._img_quota_check(event, cfg["limit"])
+        # 按渠道取配置
+        nai_cfg = self._nai_cfg()
+        tusi_cfg = self._tusi_cfg() if use_tusi else None
+        if use_tusi:
+            if not (tusi_cfg["api_key"] and tusi_cfg["template_id"]):
+                yield event.plain_result(
+                    "⚠️ 吐司生图尚未配置完整\n"
+                    "请在后台填写「吐司 API Key」与「吐司模板(ID)」，详见 /生图帮助"
+                )
+                return
+        elif not nai_cfg["key"]:
+            yield event.plain_result(
+                "⚠️ 尚未配置 NovelAI API Key\n请联系管理员在后台插件配置中填写「生图 API Key」"
+            )
+            return
+
+        denied = self._img_quota_check(event, nai_cfg["limit"])
         if denied:
             yield event.plain_result(denied)
             return
@@ -2652,20 +2916,26 @@ class NeteaseMusicPlugin(Star):
                 yield event.plain_result(err)
                 return
             positive, negative = self._normalize_tags(
-                positive, negative, cfg["extra_negative"]
+                positive, negative, nai_cfg["extra_negative"]
             )
 
-            yield event.plain_result(
-                f"🖌️ 正在生成图片（{cfg['width']}x{cfg['height']} · "
-                f"{cfg['steps']} 步），通常需要十几秒，请稍候…"
-            )
-            image, err = await self._nai_generate(positive, negative, cfg)
+            if use_tusi:
+                yield event.plain_result(
+                    f"🍞 已提交到吐司（模板 {tusi_cfg['template_id']}），排队/生成中，请稍候…"
+                )
+                image, err = await self._tusi_generate(positive, negative, tusi_cfg)
+            else:
+                yield event.plain_result(
+                    f"🖌️ 正在生成图片（{nai_cfg['width']}x{nai_cfg['height']} · "
+                    f"{nai_cfg['steps']} 步），通常需要十几秒，请稍候…"
+                )
+                image, err = await self._nai_generate(positive, negative, nai_cfg)
             if err:
                 yield event.plain_result(err)
                 return
 
             # 仅在成功后计数，避免网络/配置问题白扣用户次数
-            self._img_quota_commit(event, cfg["limit"])
+            self._img_quota_commit(event, nai_cfg["limit"])
             image_path = self._bytes_to_tempfile(image, ".png", "netease_aigen")
             yield event.image_result(image_path)
             self._schedule_tempfile_cleanup(image_path)
@@ -2679,13 +2949,16 @@ class NeteaseMusicPlugin(Star):
     async def cmd_image_gen_help(self, event: AstrMessageEvent):
         """/生图帮助 → 查看生图用法、当前配置与可选用的对话模型 ID"""
         cfg = self._nai_cfg()
-        lines = ["🎨 NovelAI 生图", "━━━━━━━━━━━━"]
+        lines = ["🎨 AI 生图", "━━━━━━━━━━━━"]
         if self._nai_enabled():
             lines.append("用法：/生图 中文描述")
             lines.append("示例：/生图 蓝发少女站在樱花树下，微笑，逆光")
+            if self._tusi_ready():
+                lines.append("走吐司接口：/生图 吐司 中文描述")
         else:
             lines.append("⛔ 当前已被管理员关闭，请在后台插件配置中开启")
         lines.append("")
+        lines.append("【NovelAI】")
         lines.append(f"模型：{cfg['model']}")
         lines.append(f"接口：{cfg['url']}")
         lines.append(
@@ -2693,7 +2966,17 @@ class NeteaseMusicPlugin(Star):
             f"CFG {cfg['scale']:g} · {cfg['sampler']}"
         )
         lines.append(f"API Key：{'已配置' if cfg['key'] else '未配置'}")
+
+        tusi = self._tusi_cfg()
+        tusi_ok = bool(tusi["api_key"] and tusi["template_id"])
+        lines.append("")
+        lines.append("【吐司】")
+        lines.append(f"状态：{'已配置' if tusi_ok else '未配置（需填 API Key 与模板 ID）'}")
+        lines.append(f"接口：{tusi['base_url']}")
+        lines.append(f"模板：{tusi['template_id'] or '（未填写）'}")
+
         provider_id = str(self.config.get("nai_tag_provider") or "").strip()
+        lines.append("")
         lines.append(f"转换模型：{provider_id or '（AstrBot 当前默认对话模型）'}")
         if cfg["limit"] > 0:
             lines.append(

@@ -283,7 +283,7 @@ TOTAL_WIDTH = 600
 
 # 歌单根目录（与 main.py 的 MUSIC_ROOT 一致）
 MUSIC_ROOT = r"D:\music"
-PLUGIN_VERSION = "1.7.0"  # 插件版本号（每次更新/修改递增）
+PLUGIN_VERSION = "1.8.0"  # 插件版本号（每次更新/修改递增）
 
 
 # ==================== 背景 ====================
