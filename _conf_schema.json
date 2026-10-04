@@ -205,6 +205,77 @@
     "default": "",
     "description": "可单独为歌单图指定随机图接口（需直接返回图片二进制流）。留空则沿用上方「随机图 API 地址」的通用接口。"
   },
+  "enable_image_gen": {
+    "type": "bool",
+    "title": "开启「/生图」（NovelAI 生图）",
+    "default": false,
+    "description": "控制 /生图 功能：用户发送 /生图 中文描述，先由大模型转成英文绘画 tag，再调用 NovelAI 生成二次元插画并发送。生图会消耗 NovelAI 的 Anlas 额度，请按需开启。"
+  },
+  "nai_api_url": {
+    "type": "string",
+    "title": "生图 API 地址",
+    "default": "https://image.novelai.net/ai/generate-image",
+    "description": "NovelAI 生图接口地址。官方主机为 https://image.novelai.net（旧域名 api.novelai.net 已不支持新模型，会返回 400）。使用第三方中转时填其中转地址。"
+  },
+  "nai_api_key": {
+    "type": "string",
+    "title": "生图 API Key",
+    "default": "",
+    "description": "NovelAI 的持久化 Token（形如 pst-...），在 novelai.net 账号设置中生成；注意不是登录用的 access token。使用第三方中转时填其分配的 Key。"
+  },
+  "nai_model": {
+    "type": "string",
+    "title": "生图模型",
+    "default": "nai-diffusion-4-5-full",
+    "description": "模型 ID。常用：nai-diffusion-4-5-full（V4.5 完整版）/ nai-diffusion-4-5-curated（V4.5 精修版）/ nai-diffusion-5-full（V5）/ nai-diffusion-3（V3）。填错会返回 400。"
+  },
+  "nai_size": {
+    "type": "string",
+    "title": "生图尺寸",
+    "default": "832x1216",
+    "description": "格式为 宽x高，例如 832x1216（竖版）、1216x832（横版）、1024x1024（方图）。会自动对齐到 64 的倍数，超出总像素上限时自动等比缩小。"
+  },
+  "nai_steps": {
+    "type": "int",
+    "title": "生图步数",
+    "default": 28,
+    "minimum": 1,
+    "maximum": 50,
+    "description": "采样步数，默认 28。步数越高细节越多但越慢；超过 28 步时多数档位会额外消耗 Anlas。"
+  },
+  "nai_scale": {
+    "type": "float",
+    "title": "生图 CFG（提示词引导强度）",
+    "default": 5.0,
+    "description": "提示词引导强度，默认 5。数值越高越贴合提示词但画面越僵硬，常用 4~7。"
+  },
+  "nai_sampler": {
+    "type": "string",
+    "title": "生图采样器",
+    "default": "k_euler_ancestral",
+    "options": ["k_euler_ancestral", "k_euler", "k_dpmpp_2m", "k_dpmpp_2s_ancestral", "k_dpmpp_sde", "ddim", "k_heun", "k_dpm_2", "k_dpm_2_ancestral"],
+    "description": "采样算法，默认 k_euler_ancestral。不确定就用默认值。"
+  },
+  "nai_negative_extra": {
+    "type": "string",
+    "title": "额外负面词（可留空）",
+    "default": "",
+    "description": "追加到负面提示词末尾的固定内容，多个用英文逗号分隔，例如 extra fingers, watermark。基础负面词已内置：lowres, bad anatomy, bad hands, extra limbs, deformed, blurry, ugly。"
+  },
+  "nai_tag_provider": {
+    "type": "string",
+    "title": "生图 tag 转换模型 ID（可留空）",
+    "default": "",
+    "description": "用于把中文描述转成英文绘画 tag 的对话模型 ID；留空则使用 AstrBot 当前默认对话模型。可用 ID 可发送 /生图帮助 查看。"
+  },
+  "nai_daily_limit": {
+    "type": "int",
+    "title": "每人每日生图次数上限",
+    "default": 5,
+    "minimum": 0,
+    "maximum": 1000,
+    "description": "每位用户每天最多生图次数，默认 5；填 0 表示不限制。生图会消耗 Anlas 额度，建议设置上限。"
+  },
   "music_root": {
     "type": "string",
     "title": "音乐文件夹保存位置",
