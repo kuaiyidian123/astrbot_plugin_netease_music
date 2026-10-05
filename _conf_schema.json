@@ -264,9 +264,10 @@
   },
   "nai_tag_provider": {
     "type": "string",
-    "title": "生图 tag 转换模型 ID（可留空）",
+    "title": "生图 tag 转换模型（下拉选择，可留空）",
     "default": "",
-    "description": "用于把中文描述转成英文绘画 tag 的对话模型 ID；留空则使用 AstrBot 当前默认对话模型。可用 ID 可发送 /生图帮助 查看。"
+    "_special": "select_provider",
+    "description": "下拉选择把中文描述转成英文绘画 tag 的对话模型；留空则使用 AstrBot 当前默认对话模型。"
   },
   "nai_daily_limit": {
     "type": "int",

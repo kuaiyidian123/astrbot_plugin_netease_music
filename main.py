@@ -214,7 +214,7 @@ def _describe_llm_error(err: Exception) -> str:
         tip = "原因：调用模型时出错"
     if detail:
         tip += f"\n原始错误：{detail[:160]}{'…' if len(detail) > 160 else ''}"
-    tip += "\n（可在后台把「生图 tag 转换模型 ID」换成其他可用模型）"
+    tip += "\n（可在后台「生图 tag 转换模型」下拉里换其他可用模型）"
     return tip
 
 
@@ -477,7 +477,7 @@ def _format_play_count(value) -> str:
     "astrbot_plugin_netease_music",
     "kuaiyidian123",
     "网易云点歌插件，支持 Cookie 导入登录，搜索歌曲并返回图片列表，选择后以语音发送",
-    "1.8.1",
+    "1.8.2",
     "https://github.com/kuaiyidian123/astrbot_plugin_netease_music"
 )
 class NeteaseMusicPlugin(Star):
@@ -2514,7 +2514,7 @@ class NeteaseMusicPlugin(Star):
         if prov is None:
             return None, (
                 "❌ 未找到可用的对话模型\n"
-                "请在 AstrBot 中配置模型，或在后台把「生图 tag 转换模型 ID」改成本实例已有的模型 ID"
+                "请在 AstrBot 中配置模型，或在后台「生图 tag 转换模型」下拉里选一个本实例已有的模型"
             )
         return prov, None
 
@@ -2599,7 +2599,7 @@ class NeteaseMusicPlugin(Star):
             return "", "", (
                 "❌ 关键词转换结果格式异常\n"
                 "通常是当前对话模型没有按约定格式输出，可重试或换个描述；"
-                "若持续出现，可在后台把「生图 tag 转换模型 ID」换成其他模型\n"
+                "若持续出现，可在后台「生图 tag 转换模型」下拉里换其他模型\n"
                 f"模型原始输出：{preview}"
             )
         return pos, neg, None
@@ -3092,7 +3092,7 @@ class NeteaseMusicPlugin(Star):
             providers = []
         if providers:
             lines.append("")
-            lines.append("可选转换模型 ID（填到后台「生图 tag 转换模型 ID」）：")
+            lines.append("可选转换模型（在后台「生图 tag 转换模型」下拉里选择）：")
             for i, prov in enumerate(providers[:20], 1):
                 try:
                     meta = prov.meta()
