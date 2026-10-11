@@ -264,7 +264,7 @@ pip install Pillow aiohttp
 | 音乐文件夹保存位置 | string | D:\music | 本地歌单根目录，可填任意盘路径 |
 | 开启歌单功能 | bool | true | 关闭后歌单相关指令全部不可用（创建歌单/歌单/删除/补封面/绑定系列） |
 | 开启留言功能 | bool | true | 关闭后留言相关指令全部不可用（留言/删除留言） |
-| 自建网易云 API 地址 | string | 空 | 填 NeteaseCloudMusicApi / Enhanced 部署地址（如 `http://127.0.0.1:3000`），留空直连官方 `music.163.com` |
+| 自建网易云 API 地址 | string | 空 | 填 NeteaseCloudMusicApi / Enhanced 部署地址，留空直连官方 `music.163.com`；免费公共 API 见下方说明 |
 | HTTP 代理地址 | string | 空 | 代理访问网易云服务，如 `http://127.0.0.1:7890` |
 | 开启「选歌搜视频」（按歌曲搜） | bool | false | 控制 `/点歌` 后「`序号 搜索视频`」入口 |
 | 开启「/搜视频」直接搜索 | bool | true | 控制 `/搜视频 关键词` 入口；与上一项**互不影响** |
@@ -297,6 +297,25 @@ pip install Pillow aiohttp
 | 每人每日生图次数上限 | int | 5 | 0 = 不限；仅生成成功后计数 |
 | 生图群聊黑名单 | list | 空 | 名单内的群号禁用 `/生图`（不影响私聊） |
 | 生图 QQ 黑名单 | list | 空 | 名单内的 QQ 号禁止使用 `/生图` |
+
+### 🌐 自建网易云 API（可选）
+
+插件默认直连官方 `music.163.com`。若想走自建服务，在「自建网易云 API 地址」填入 NeteaseCloudMusicApi / Enhanced 的部署地址即可，插件会自动适配接口路径与参数，**无需修改服务端**。
+
+- **免费公共 API**：`http://103.236.84.213:45809`
+  - 仅方便快速体验，速度与稳定性无法保证，随时可能失效；长期使用建议自行部署
+  - 填写时不要漏掉开头的 `http://`
+- 自建模式下会自动把已导入的 Cookie 作为 `cookie` 参数传给服务端（域名变了，无法再靠会话自动携带 Cookie）
+- 若自建服务不支持所选音质档位，插件会自动降级到可用档位
+
+接口适配对照：
+
+| 插件调用 | 自建 API |
+|---|---|
+| `/api/cloudsearch/pc`（`s`） | `/cloudsearch`（`keywords`） |
+| `/api/v6/playlist/detail` | `/playlist/detail` |
+| `/api/v3/song/detail`（`c` JSON 数组） | `/song/detail`（`ids` 逗号分隔） |
+| `/api/song/enhance/player/url/v1`（`ids`） | `/song/url/v1`（`id` 单数） |
 
 ## 📂 文件结构
 
