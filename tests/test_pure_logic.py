@@ -104,6 +104,45 @@ class PureLogicTest(unittest.TestCase):
         self.assertTrue(NeteaseMusicPlugin._is_admin(binding, "10002"))
         self.assertFalse(NeteaseMusicPlugin._is_admin(binding, "10003"))
 
+    # ---------- _norm_id_set：生图黑名单归一化 ----------
+
+    def test_norm_id_set_list_and_str(self):
+        norm = NeteaseMusicPlugin._norm_id_set
+        self.assertEqual(norm(["10001", " 10002 ", ""]), {"10001", "10002"})
+        # 兼容后台被填成一行逗号/顿号/空格分隔的字符串
+        self.assertEqual(norm("10001, 10002、10003 10004"), {"10001", "10002", "10003", "10004"})
+        # 空值/异常类型不应抛错
+        self.assertEqual(norm(None), set())
+        self.assertEqual(norm([]), set())
+        self.assertEqual(norm(123), {"123"})
+
+    # ---------- _to_self_hosted_request：自建 API 接口适配 ----------
+
+    def test_self_hosted_request_mapping(self):
+        adapt = NeteaseMusicPlugin._to_self_hosted_request
+        # 搜索：官方的 s 参数 -> 自建的 keywords
+        p, q = adapt("/api/cloudsearch/pc", {"s": "晴天", "type": 1, "limit": 20, "offset": 0})
+        self.assertEqual(p, "/cloudsearch")
+        self.assertEqual(q["keywords"], "晴天")
+        self.assertEqual(q["type"], 1)
+        # 歌单详情
+        self.assertEqual(
+            adapt("/api/v6/playlist/detail", {"id": 123, "n": 1000}),
+            ("/playlist/detail", {"id": 123}),
+        )
+        # 歌曲详情：c 的 JSON 数组 -> 逗号分隔的 ids
+        self.assertEqual(
+            adapt("/api/v3/song/detail", {"c": '[{"id":1},{"id":22},{"id":333}]'}),
+            ("/song/detail", {"ids": "1,22,333"}),
+        )
+        # 播放链接：ids 数组 -> 单数 id
+        self.assertEqual(
+            adapt("/api/song/enhance/player/url/v1", {"ids": "[3438985423]", "level": "sky"}),
+            ("/song/url/v1", {"id": "3438985423", "level": "sky"}),
+        )
+        # 未收录的路径原样返回
+        self.assertEqual(adapt("/api/other", {"a": 1}), ("/api/other", {"a": 1}))
+
     # ---------- _match_playlist_and_song ----------
 
     def _make_plugin(self, music_root):

@@ -477,7 +477,7 @@ def _format_play_count(value) -> str:
     "astrbot_plugin_netease_music",
     "kuaiyidian123",
     "网易云点歌插件，支持 Cookie 导入登录，搜索歌曲并返回图片列表，选择后以语音发送",
-    "1.8.2",
+    "1.9.0",
     "https://github.com/kuaiyidian123/astrbot_plugin_netease_music"
 )
 class NeteaseMusicPlugin(Star):
@@ -765,16 +765,64 @@ class NeteaseMusicPlugin(Star):
 
     # ==================== 通用 HTTP ====================
 
+    def _netease_api_base(self) -> str:
+        """自建网易云 API 地址（NeteaseCloudMusicApi / Enhanced）；留空表示直连官方"""
+        return str(self.config.get("netease_api_url") or "").strip().rstrip("/")
+
+    @staticmethod
+    def _to_self_hosted_request(path: str, params: Dict) -> tuple:
+        """把官方接口调用翻译成自建 API 的路径与参数，返回 (path, params)
+
+        自建 API（NeteaseCloudMusicApi / Enhanced）的路径不带 /api 前缀，且部分参数
+        与官方不同：搜索用 keywords、歌曲详情用逗号分隔的 ids、播放链接用单数 id。
+        未收录的路径原样返回，便于后续扩展。
+        """
+        p = dict(params or {})
+        if path == "/api/cloudsearch/pc":
+            return "/cloudsearch", {
+                "keywords": p.get("s", ""),
+                "type": p.get("type", 1),
+                "limit": p.get("limit", 30),
+                "offset": p.get("offset", 0),
+            }
+        if path == "/api/v6/playlist/detail":
+            return "/playlist/detail", {"id": p.get("id")}
+        if path == "/api/v3/song/detail":
+            ids = re.findall(r"\d+", str(p.get("c", "")))
+            return "/song/detail", {"ids": ",".join(ids)}
+        if path == "/api/song/enhance/player/url/v1":
+            ids = re.findall(r"\d+", str(p.get("ids", "")))
+            return "/song/url/v1", {
+                "id": ",".join(ids),
+                "level": p.get("level", "exhigh"),
+            }
+        return path, p
+
+    def _attach_cookie_param(self, params: Dict) -> None:
+        """自建 API 需把登录凭证作为参数传递（请求域名与官方不同，cookie jar 不会自动带上）"""
+        if not self._cookies:
+            return
+        cookie = "; ".join(f"{k}={v}" for k, v in self._cookies.items() if v)
+        if cookie:
+            params["cookie"] = cookie
+
     async def _api_get(self, path: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """GET 请求网易云 API"""
+        """GET 请求网易云 API（直连官方；配置了自建 API 时自动适配到自建）"""
         try:
             session = await self._get_http_session()
             proxy = self._get_proxy()
             params = dict(params or {})
-            params['timestamp'] = int(time.time() * 1000)
+            base = self._netease_api_base()
+            if base:
+                path, params = self._to_self_hosted_request(path, params)
+                self._attach_cookie_param(params)
+                url = f"{base}{path}"
+            else:
+                params['timestamp'] = int(time.time() * 1000)
+                url = f"{NETEASE}{path}"
 
             async with session.get(
-                f"{NETEASE}{path}",
+                url,
                 params=params,
                 headers=DEFAULT_HEADERS,
                 proxy=proxy
@@ -785,17 +833,24 @@ class NeteaseMusicPlugin(Star):
             return None
 
     async def _api_post_form(self, path: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """POST form-urlencoded 请求网易云 API"""
+        """POST form-urlencoded 请求网易云 API（直连官方；配置了自建 API 时自动适配到自建）"""
         try:
             session = await self._get_http_session()
             proxy = self._get_proxy()
             params = dict(params or {})
-            params['timestamp'] = int(time.time() * 1000)
+            base = self._netease_api_base()
+            if base:
+                path, params = self._to_self_hosted_request(path, params)
+                self._attach_cookie_param(params)
+                url = f"{base}{path}"
+            else:
+                params['timestamp'] = int(time.time() * 1000)
+                url = f"{NETEASE}{path}"
 
             headers = {**DEFAULT_HEADERS, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}
 
             async with session.post(
-                f"{NETEASE}{path}",
+                url,
                 data=params,
                 headers=headers,
                 proxy=proxy
@@ -807,7 +862,7 @@ class NeteaseMusicPlugin(Star):
 
     # ==================== 指令：点歌帮助 ====================
 
-    @filter.command("点歌帮助")
+    @filter.command("点歌帮助", alias={"歌单帮助"})
     async def cmd_help(self, event: AstrMessageEvent):
         """列出所有功能与用法，渲染成图片发送（文本模式下直接发文本）"""
         if self._text_mode():
@@ -1200,18 +1255,20 @@ class NeteaseMusicPlugin(Star):
                 try:
                     with open(save_path, 'wb') as f:
                         f.write(audio_data)
-
-                    # 封面自动保存到歌单文件夹（渲染歌单图时直接读本地）
-                    await self._save_song_cover(selected_song, playlist_dir, safe_name)
-
-                    yield event.plain_result(
-                        f"✅ 已保存到歌单「{download_playlist}」\n"
-                        f"🎵 {artist_name} - {song_name}\n"
-                        f"📁 {download_playlist}/{os.path.basename(save_path)}"
-                    )
                 except OSError as e:
                     yield event.plain_result(self._err_msg(e, "保存文件"))
                     return
+
+                # 先回执成功，再去抓封面：封面只是锦上添花，不能挡在成功提示前面
+                # （封面是网络请求，若被取消/中断会导致文件已保存却收不到任何回复）
+                yield event.plain_result(
+                    f"✅ 已保存到歌单「{download_playlist}」\n"
+                    f"🎵 {artist_name} - {song_name}\n"
+                    f"📁 {download_playlist}/{os.path.basename(save_path)}"
+                )
+
+                # 封面自动保存到歌单文件夹（渲染歌单图时直接读本地），失败只记日志
+                await self._save_song_cover(selected_song, playlist_dir, safe_name)
             else:
                 # ===== 直接播放模式（发送方式见 _emit_audio） =====
                 for result in self._emit_audio(
@@ -2426,6 +2483,37 @@ class NeteaseMusicPlugin(Star):
         """「/生图」功能开关"""
         return bool(self.config.get("enable_image_gen", False))
 
+    @staticmethod
+    def _norm_id_set(raw) -> set:
+        """把配置里的黑名单归一化成 ID 集合，兼容 list 与逗号/空格分隔的字符串"""
+        if isinstance(raw, str):
+            raw = re.split(r"[,，、;；\s]+", raw)
+        elif isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            raw = [raw]
+        try:
+            items = list(raw or [])
+        except TypeError:
+            return set()
+        return {str(it).strip() for it in items if str(it).strip()}
+
+    def _nai_blacklist_hit(self, event: AstrMessageEvent) -> str:
+        """命中生图黑名单时返回提示文案，未命中返回空串"""
+        groups = self._norm_id_set(self.config.get("nai_group_blacklist"))
+        users = self._norm_id_set(self.config.get("nai_user_blacklist"))
+        if not groups and not users:
+            return ""
+        uid = self._get_user_id(event)
+        if uid and uid in users:
+            return "⚠️ 你已被管理员加入 /生图 黑名单，无法使用该功能"
+        if groups:
+            try:
+                gid = str(event.get_group_id() or "")
+            except Exception:
+                gid = ""
+            if gid and gid in groups:
+                return "⚠️ 本群已被管理员禁用 /生图"
+        return ""
+
     def _nai_cfg(self) -> Dict[str, Any]:
         """解析并收敛生图配置（后台填错也不会直接崩，统一夹紧到安全范围）"""
         try:
@@ -2967,6 +3055,11 @@ class NeteaseMusicPlugin(Star):
             yield event.plain_result("⚠️「/生图」功能已被管理员关闭")
             return
 
+        blocked = self._nai_blacklist_hit(event)
+        if blocked:
+            yield event.plain_result(blocked)
+            return
+
         raw = self._strip_command(event.message_str, "生图")
         use_tusi, text = _split_tusi_prefix(raw)
         if not text:
@@ -3084,6 +3177,11 @@ class NeteaseMusicPlugin(Star):
             )
         else:
             lines.append("次数限制：不限")
+
+        blocked = self._nai_blacklist_hit(event)
+        if blocked:
+            lines.append("")
+            lines.append(blocked)
 
         try:
             providers = list(self.context.get_all_providers())
