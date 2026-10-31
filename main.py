@@ -284,6 +284,442 @@ QUALITY_MAP = {
 }
 
 NETEASE = "https://music.163.com"
+
+# ============ 扫码登录 ============
+QR_LOGIN_TYPE = 3          # unikey 类型：1=web(已废弃) 3=App 扫码
+QR_LOGIN_TTL = 180         # 单个二维码有效期（秒），过期需重新获取
+QR_LOGIN_POLL_INTERVAL = 4  # 后台轮询间隔（秒），网易云官方页面同样按秒级轮询
+# 轮询返回码：800 成功 / 801 等待扫码 / 802 已扫码待确认 / 803 二维码过期
+_QR_CODE_HINTS = {
+    800: "登录成功",
+    801: "等待扫码",
+    802: "已扫码，请在手机上确认登录",
+    803: "二维码已过期",
+}
+
+
+# ==================== 二维码渲染（纯标准库，无第三方依赖） ====================
+
+_QR_ALNUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+
+
+class _QRError(ValueError):
+    """二维码无法编码时抛出（内容过长等）"""
+
+
+class _QRCode:
+    """最小可用的 QR Code 编码器（字节模式 + 纠错 L 级，版本 1~10 自动选择）
+
+    仅用于把登录链接渲染成二维码图片，不追求完整规范的边角情形：
+    - 字符计数按字节模式固定 8 位（版本 1~9 合法；版本 10 会多出 8 位，
+      因此实际只在 1~9 中自动选择，最大约 230 字节，登录链接远小于该值）
+    - 纠错码块与交织按 ISO/IEC 18004 表格硬编码
+    - 格式信息写入顺序按规范 BCH(15,5) 多项式 0x537 与掩码 0x5412 手工实现
+    """
+
+    # 各版本的「每块纠错码字数, [(块数, 每块数据字数), ...]」（L 级纠错，版本 1~10）
+    ECC_L_TABLE = {
+        1: (7, [(1, 19)]),
+        2: (10, [(1, 34)]),
+        3: (15, [(1, 55)]),
+        4: (20, [(1, 80)]),
+        5: (26, [(1, 108)]),
+        6: (18, [(2, 68)]),
+        7: (20, [(2, 78)]),
+        8: (24, [(2, 97)]),
+        9: (30, [(2, 116)]),
+        10: (18, [(2, 68), (2, 69)]),
+    }
+    # 实际生成时使用的最大版本（版本 10 的字节模式字符计数为 16 位，此处未实现）
+    MAX_VERSION = 9
+    # 纠错等级 L 的格式位（2 bit）
+    _ECL_BITS = 0b01
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.version = self._pick_version(len(data))
+        self.size = 17 + 4 * self.version
+        self._modules = [[False] * self.size for _ in range(self.size)]
+        self._function = [[False] * self.size for _ in range(self.size)]
+        self._build()
+
+    # ---------- 版本与容量 ----------
+    @classmethod
+    def _pick_version(cls, length: int) -> int:
+        for version in range(1, cls.MAX_VERSION + 1):
+            if length <= cls._data_capacity(version):
+                return version
+        raise _QRError("内容过长，无法生成二维码")
+
+    @classmethod
+    def _block_layout(cls, version: int) -> List[int]:
+        """把数据区按块长度展开，例如 v10 -> [68, 68, 69, 69]"""
+        return [length for count, length in cls.ECC_L_TABLE[version][1] for _ in range(count)]
+
+    @classmethod
+    def _data_capacity(cls, version: int) -> int:
+        """该版本 L 级纠错可容纳的数据字节数（已扣除模式指示符与字符计数位）"""
+        total = sum(cls._block_layout(version))
+        header_bits = 4 + (8 if version < 10 else 16)
+        return total - (header_bits + 7) // 8
+
+    # ---------- 构建矩阵 ----------
+    def _build(self) -> None:
+        self._draw_function_patterns()
+        codewords = self._build_codewords()
+        self._draw_codewords(codewords)
+        mask = self._choose_mask()
+        self._modules = self._build_final_modules(mask)
+
+    @staticmethod
+    def _bit(value: int, index: int) -> bool:
+        return ((value >> index) & 1) == 1
+
+    def _set_function(self, x: int, y: int, dark: bool) -> None:
+        self._modules[y][x] = dark
+        self._function[y][x] = True
+
+    def _draw_function_patterns(self) -> None:
+        size = self.size
+        # 三个角上的定位图案（7x7 回字）+ 1 模块宽的白色分隔符
+        for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):
+            for dy in range(-4, 5):
+                for dx in range(-4, 5):
+                    x, y = cx + dx, cy + dy
+                    if not (0 <= x < size and 0 <= y < size):
+                        continue
+                    dist = max(abs(dx), abs(dy))
+                    # d<=1 实心核，d==2 白环，d==3 黑环，d==4 白分隔符
+                    self._set_function(x, y, dist < 2 or dist == 3)
+        # 定时图案（横向与纵向各一条，黑白交替）
+        for i in range(8, size - 8):
+            dark = i % 2 == 0
+            self._set_function(i, 6, dark)
+            self._set_function(6, i, dark)
+        # 校正图案（版本 2 起）
+        if self.version >= 2:
+            positions = self._alignment_positions()
+            last = len(positions) - 1
+            for i, ax in enumerate(positions):
+                for j, ay in enumerate(positions):
+                    if (i, j) in ((0, 0), (0, last), (last, 0)):
+                        continue
+                    for dy in range(-2, 3):
+                        for dx in range(-2, 3):
+                            dist = max(abs(dx), abs(dy))
+                            self._set_function(ax + dx, ay + dy, dist != 1)
+        # 版本信息（版本 7 起，BCH(18,6)，多项式 0x1F25）
+        if self.version >= 7:
+            value = self.version << 12
+            rem = value
+            for _ in range(12):
+                rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+            value |= rem & 0xFFF
+            for i in range(18):
+                dark = self._bit(value, i)
+                a, b = size - 11 + i % 3, i // 3
+                self._set_function(a, b, dark)
+                self._set_function(b, a, dark)
+        # 预留格式信息区域（与底部定位图案重叠的格子已由定位图案占位，跳过）
+        fmt_cells = [(8, i) for i in range(9)] + [(i, 8) for i in range(9)]
+        fmt_cells += [(size - 1 - i, 8) for i in range(8)]
+        fmt_cells += [(8, size - 1 - i) for i in range(7)]
+        for x, y in fmt_cells:
+            self._set_function(x, y, False)
+        self._set_function(8, size - 8, True)  # 固定暗模块
+
+    def _alignment_positions(self) -> List[int]:
+        if self.version == 1:
+            return []
+        count = self.version // 7 + 2
+        step = (self.version * 4 + count * 2 + 1) // (count * 2 - 2) * 2
+        result = [self.size - 7]
+        pos = self.size - 7
+        for _ in range(count - 1):
+            pos -= step
+            result.append(pos)
+        return sorted(result)
+
+    def _build_codewords(self) -> List[int]:
+        data_bits = self._data_bits()
+        layout = self._block_layout(self.version)
+        data_codewords = [
+            sum(data_bits[j + i] << (7 - i) for i in range(8))
+            for j in range(0, len(data_bits), 8)
+        ]
+        capacity = sum(layout)
+        if len(data_codewords) < capacity:
+            data_codewords += [0] * (capacity - len(data_codewords))
+        data_codewords = data_codewords[:capacity]
+
+        ecc_per_block = self.ECC_L_TABLE[self.version][0]
+        data_blocks: List[List[int]] = []
+        ecc_blocks: List[List[int]] = []
+        offset = 0
+        for length in layout:
+            block = data_codewords[offset:offset + length]
+            offset += length
+            data_blocks.append(block)
+            ecc_blocks.append(_rs_remainder(block, ecc_per_block))
+
+        # 交织：数据按「列」取，纠错码同理
+        result: List[int] = []
+        for i in range(max(layout)):
+            for block in data_blocks:
+                if i < len(block):
+                    result.append(block[i])
+        for i in range(ecc_per_block):
+            for block in ecc_blocks:
+                result.append(block[i])
+        return result
+
+    def _data_bits(self) -> List[int]:
+        data = self.data
+        bits: List[int] = []
+        # 模式指示符（字节模式 0100）+ 字符计数（版本 10 以下为 8 位）
+        for value, length in ((0b0100, 4), (len(data), 8 if self.version < 10 else 16)):
+            for i in range(length - 1, -1, -1):
+                bits.append((value >> i) & 1)
+        for byte in data:
+            for i in range(7, -1, -1):
+                bits.append((byte >> i) & 1)
+        capacity_bits = sum(self._block_layout(self.version)) * 8
+        # 终止符
+        bits += [0] * min(4, capacity_bits - len(bits))
+        # 补齐到字节边界
+        while len(bits) % 8:
+            bits.append(0)
+        # 填充字节（0xEC / 0x11 交替）
+        pad = 0xEC
+        while len(bits) < capacity_bits:
+            bits += [(pad >> i) & 1 for i in range(7, -1, -1)]
+            pad ^= 0xEC ^ 0x11
+        return bits
+
+    def _draw_codewords(self, codewords: List[int]) -> None:
+        """按规范规定的之字形路径把码字铺进数据区"""
+        size = self.size
+        bits = [self._bit(byte, i) for byte in codewords for i in range(7, -1, -1)]
+        index = 0
+        right = size - 1
+        upward = True
+        while right >= 1:
+            if right == 6:  # 第 6 列是定时图案列，跳过
+                right = 5
+            for vert in range(size):
+                for j in range(2):
+                    x = right - j
+                    y = size - 1 - vert if upward else vert
+                    if not self._function[y][x]:
+                        if index < len(bits):
+                            self._modules[y][x] = bits[index]
+                            index += 1
+            upward = not upward
+            right -= 2
+
+    @staticmethod
+    def _format_bits(mask: int) -> int:
+        """格式信息：5 位（纠错等级 2 + 掩码 3）经 BCH(15,5) 编码后异或 0x5412"""
+        data = (_QRCode._ECL_BITS << 3) | mask
+        rem = data
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        return ((data << 10) | (rem & 0x3FF)) ^ 0x5412
+
+    def _write_format_bits(self, modules: List[List[bool]], mask: int) -> None:
+        """把两份格式信息写入给定矩阵（与 self._modules 解耦，便于掩码评估）"""
+        size = self.size
+        bits = self._format_bits(mask)
+
+        def put(x: int, y: int, index: int) -> None:
+            modules[y][x] = self._bit(bits, index)
+
+        # 副本一：左上角沿定位图案内侧的 L 形
+        for i in range(6):
+            put(8, i, i)
+        put(8, 7, 6)
+        put(8, 8, 7)
+        put(7, 8, 8)
+        for i in range(9, 15):
+            put(14 - i, 8, i)
+        # 副本二：右上角一行 + 左下角一列
+        for i in range(8):
+            put(size - 1 - i, 8, i)
+        for i in range(8, 15):
+            put(8, size - 15 + i, i)
+        # 固定暗模块
+        modules[size - 8][8] = True
+
+    def _draw_format_bits(self, mask: int = 0) -> None:
+        self._write_format_bits(self._modules, mask)
+        size = self.size
+        for x, y in [(8, i) for i in range(9)] + [(i, 8) for i in range(9)]:
+            self._function[y][x] = True
+        for i in range(8):
+            self._function[8][size - 1 - i] = True
+            self._function[size - 1 - i][8] = True
+
+    @staticmethod
+    def _mask_condition(mask: int, x: int, y: int) -> bool:
+        i, j = x, y
+        return (
+            (i + j) % 2 == 0,
+            i % 2 == 0,
+            j % 3 == 0,
+            (i + j) % 3 == 0,
+            (i // 3 + j // 2) % 2 == 0,
+            i * j % 2 + i * j % 3 == 0,
+            (i * j % 2 + i * j % 3) % 2 == 0,
+            ((i + j) % 2 + i * j % 3) % 2 == 0,
+        )[mask]
+
+    def _build_final_modules(self, mask: int) -> List[List[bool]]:
+        """按指定掩码生成最终矩阵（数据区加掩码 + 写入对应格式信息）"""
+        size = self.size
+        modules = [row[:] for row in self._modules]
+        for y in range(size):
+            for x in range(size):
+                if not self._function[y][x] and self._mask_condition(mask, x, y):
+                    modules[y][x] = not modules[y][x]
+        self._write_format_bits(modules, mask)
+        return modules
+
+    def _penalty(self, modules: List[List[bool]]) -> int:
+        size = self.size
+        score = 0
+        # 规则 1：同色连续 >= 5
+        for line in ([modules[y][x] for x in range(size)] for y in range(size)):
+            run, prev = 0, None
+            for value in line + [None]:
+                if value == prev:
+                    run += 1
+                else:
+                    if run >= 5:
+                        score += run - 2
+                    run, prev = 1, value
+        for x in range(size):
+            line = [modules[y][x] for y in range(size)]
+            run, prev = 0, None
+            for value in line + [None]:
+                if value == prev:
+                    run += 1
+                else:
+                    if run >= 5:
+                        score += run - 2
+                    run, prev = 1, value
+        # 规则 2：2x2 同色块
+        for y in range(size - 1):
+            for x in range(size - 1):
+                v = modules[y][x]
+                if v == modules[y][x + 1] == modules[y + 1][x] == modules[y + 1][x + 1]:
+                    score += 3
+        # 规则 3：1:1:3:1:1 类似定位图案
+        pattern_a = [True, False, True, True, True, False, True, False, False, False, False]
+        pattern_b = pattern_a[::-1]
+        for y in range(size):
+            row = modules[y]
+            for x in range(size - 10):
+                if row[x:x + 11] == pattern_a or row[x:x + 11] == pattern_b:
+                    score += 40
+        for x in range(size):
+            col = [modules[y][x] for y in range(size)]
+            for y in range(size - 10):
+                if col[y:y + 11] == pattern_a or col[y:y + 11] == pattern_b:
+                    score += 40
+        # 规则 4：暗模块占比偏离 50%
+        dark = sum(1 for row in modules for v in row if v)
+        ratio = dark * 100 // (size * size)
+        score += abs(ratio - 50) // 5 * 10
+        return score
+
+    def _choose_mask(self) -> int:
+        best_mask, best_score = 0, None
+        for mask in range(8):
+            score = self._penalty(self._build_final_modules(mask))
+            if best_score is None or score < best_score:
+                best_mask, best_score = mask, score
+        return best_mask
+
+    # ---------- 导出 ----------
+    def to_png(self, scale: int = 8, border: int = 4) -> bytes:
+        """渲染成 PNG 字节（白底黑码，quiet zone 默认 4 模块）"""
+        size = self.size
+        total = (size + border * 2) * scale
+        # 构造灰度图然后交给 PIL 压成 PNG（PIL 是本插件已有依赖）
+        image = PILImage.new("L", (total, total), 255)
+        pixels = image.load()
+        for y in range(size):
+            for x in range(size):
+                if not self._modules[y][x]:
+                    continue
+                x0 = (x + border) * scale
+                y0 = (y + border) * scale
+                for dy in range(scale):
+                    for dx in range(scale):
+                        pixels[x0 + dx, y0 + dy] = 0
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        return buf.getvalue()
+
+
+def _rs_remainder(data: List[int], degree: int) -> List[int]:
+    """GF(256) 上的 Reed-Solomon 余式（生成多项式 0x11D）"""
+    divisor = [0] * (degree - 1) + [1]
+    root = 1
+    for _ in range(degree):
+        for j in range(degree):
+            divisor[j] = _gf_mul(divisor[j], root)
+            if j + 1 < degree:
+                divisor[j] ^= divisor[j + 1]
+        root = _gf_mul(root, 0x02)
+    result = [0] * degree
+    for byte in data:
+        factor = byte ^ result[0]
+        result = result[1:] + [0]
+        for i in range(degree):
+            result[i] ^= _gf_mul(divisor[i], factor)
+    return result
+
+
+def _gf_mul(x: int, y: int) -> int:
+    z = 0
+    for i in range(7, -1, -1):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z & 0xFF
+
+
+def _render_qr_png(text: str, scale: int = 12) -> bytes:
+    """把文本渲染成二维码 PNG 字节
+
+    优先使用成熟的 qrcode 库：它的掩码选择与纠错编码经过大量扫码器验证，
+    扫码可靠性远高于插件内置的极简实现。自动纠错等级提高到 M 级
+    （约可容忍 15% 模块损坏），输出为 RGB 白底黑码、自带 4 模块白边。
+
+    仅当 qrcode 库不可用时，才退回内置的 _QRCode（L 级纠错、最小实现）。
+    """
+    try:
+        import qrcode
+        from qrcode.constants import ERROR_CORRECT_M
+
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=ERROR_CORRECT_M,
+            box_size=scale,
+            border=4,
+        )
+        qr.add_data(text.encode("utf-8"))
+        qr.make(fit=True)
+        buf = io.BytesIO()
+        # 统一转成 RGB 再存 PNG：避免平台侧把灰度图按其他格式二次转换
+        qr.make_image(fill_color="black", back_color="white").convert("RGB").save(
+            buf, format="PNG"
+        )
+        return buf.getvalue()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"qrcode 库不可用，改用内置二维码实现: {e}")
+        return _QRCode(text.encode("utf-8")).to_png(scale=scale)
+
 MUSIC_ROOT = r"D:\music"  # 本地歌单根目录（默认值，实际以配置 music_root 为准）
 INVITE_TTL_SECONDS = 180  # 歌单成员邀请有效期（3 分钟）
 PLAYLIST_MARKER = ".netease_playlist"  # 歌单标记文件，用于识别本插件创建的目录
@@ -530,6 +966,9 @@ class NeteaseMusicPlugin(Star):
         self._session_lock = asyncio.Lock()  # 保护 HTTP 会话创建，避免并发重复建连
         self._binding_lock = asyncio.Lock()  # 保护 binding.json 的读-改-写
         self._random_bg_lock = asyncio.Lock()  # 保护随机背景图的下载与缓存写回
+        self._last_set_cookies: Dict[str, str] = {}  # 最近一次响应下发的 Set-Cookie
+        self._qr_sessions: Dict[str, Dict[str, Any]] = {}  # 扫码登录会话（按用户隔离）
+        self._qr_lock = asyncio.Lock()  # 保护扫码登录会话的创建与取消
 
         # Cookie 管理 (替代 QR 登录)
         self._cookies: Dict[str, str] = {}
@@ -553,6 +992,12 @@ class NeteaseMusicPlugin(Star):
     # ==================== 生命周期 ====================
 
     async def terminate(self):
+        # 先取消所有扫码登录轮询任务，避免卸载后后台任务继续跑
+        for state in list(self._qr_sessions.values()):
+            task = state.get('task')
+            if task and not task.done():
+                task.cancel()
+        self._qr_sessions.clear()
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
             self._http_session = None
@@ -763,6 +1208,213 @@ class NeteaseMusicPlugin(Star):
         """有 MUSIC_U Cookie 视为已登录"""
         return bool(self._cookies.get('MUSIC_U'))
 
+    # ==================== 扫码登录 ====================
+    #
+    # 网易云网页版已经改为前端 JS 动态渲染二维码，服务端不再返回二维码图片，
+    # 但「App 扫码」的官方接口仍然可用：
+    #   POST /api/login/qrcode/unikey        -> 拿 unikey（type=3 表示 App 扫码）
+    #   POST /api/login/qrcode/client/login  -> 轮询：801 等待 / 802 待确认 / 800 成功 / 803 过期
+    # 二维码内容即 https://music.163.com/login?codekey=<unikey>，由插件本地渲染成图片发送。
+    # 登录成功后网易云通过 Set-Cookie 下发 MUSIC_U，这里捕获后写回 cookies.json。
+
+    def _qr_owner(self, event: AstrMessageEvent) -> str:
+        """扫码会话归属：按「会话 + 用户」隔离，避免群内多人互相覆盖登录状态"""
+        return self._get_session_key(event)
+
+    async def _qr_start(self, event: AstrMessageEvent) -> Dict[str, Any]:
+        """创建新的扫码登录会话（同用户重复发起会先取消旧会话）"""
+        owner = self._qr_owner(event)
+        async with self._qr_lock:
+            old = self._qr_sessions.pop(owner, None)
+            if old and old.get('task') and not old['task'].done():
+                old['task'].cancel()
+
+            data = await self._api_post_form(
+                '/api/login/qrcode/unikey', {'type': QR_LOGIN_TYPE}
+            )
+            unikey = (data or {}).get('unikey')
+            if not unikey:
+                raise RuntimeError(
+                    f"获取二维码失败: {(data or {}).get('message', '接口无返回')}"
+                )
+
+            qr_text = f"{NETEASE}/login?codekey={unikey}"
+            try:
+                png = await asyncio.get_running_loop().run_in_executor(
+                    None, _render_qr_png, qr_text
+                )
+            except Exception as e:
+                raise RuntimeError(f"生成二维码图片失败: {e}") from e
+
+            image_path = self._bytes_to_tempfile(png, ".png", "netease_login_qr")
+
+        state: Dict[str, Any] = {
+            'owner': owner,
+            'unikey': unikey,
+            'qr_text': qr_text,
+            'image_path': image_path,
+            'status': 'waiting',      # waiting / scanned / success / expired / canceled
+            'create_at': time.time(),
+            'expire_at': time.time() + QR_LOGIN_TTL,
+            'poll_task': None,
+            'task': None,
+        }
+        state['poll_task'] = asyncio.create_task(self._qr_poll_loop(state))
+        self._qr_sessions[owner] = state
+        logger.info(f"[扫码登录] 已生成二维码 unikey={unikey}")
+        return state
+
+    def _qr_session(self, event: AstrMessageEvent) -> Optional[Dict[str, Any]]:
+        return self._qr_sessions.get(self._qr_owner(event))
+
+    async def _qr_cancel(self, event: AstrMessageEvent, reason: str = 'canceled') -> None:
+        owner = self._qr_owner(event)
+        state = self._qr_sessions.pop(owner, None)
+        if not state:
+            return
+        state['status'] = reason
+        for key in ('poll_task', 'task'):
+            task = state.get(key)
+            if task and not task.done():
+                task.cancel()
+
+    async def _qr_poll_loop(self, state: Dict[str, Any]) -> None:
+        """后台轮询扫码状态，直到登录成功 / 过期 / 被取消"""
+        unikey = state['unikey']
+        try:
+            while time.time() < state['expire_at']:
+                await asyncio.sleep(QR_LOGIN_POLL_INTERVAL)
+                if self._qr_sessions.get(state['owner']) is not state:
+                    return
+                data = await self._api_post_form(
+                    '/api/login/qrcode/client/login',
+                    {'key': unikey, 'type': QR_LOGIN_TYPE},
+                )
+                code = (data or {}).get('code')
+                if code == 800:
+                    await self._qr_finish_login(state, data or {})
+                    return
+                if code == 803:
+                    state['status'] = 'expired'
+                    logger.info(f"[扫码登录] 二维码已过期 unikey={unikey}")
+                    return
+                if code == 802 and state['status'] != 'scanned':
+                    state['status'] = 'scanned'
+                    logger.info(f"[扫码登录] 已扫码待确认 unikey={unikey}")
+                # 801：继续等待
+            state['status'] = 'expired'
+            logger.info(f"[扫码登录] 二维码等待超时 unikey={unikey}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            state['status'] = 'expired'
+            logger.warning(f"[扫码登录] 轮询异常: {e}")
+
+    async def _qr_finish_login(self, state: Dict[str, Any], data: Dict) -> None:
+        """扫码成功：保存下发的登录 Cookie，并记录用户信息"""
+        fresh = self._last_set_cookies or {}
+        if not fresh.get('MUSIC_U'):
+            # 少数情况下凭证在响应体里，兜底再取一次
+            body_cookie = data.get('cookie') or ''
+            if 'MUSIC_U=' in body_cookie:
+                for part in body_cookie.split(';'):
+                    if '=' in part:
+                        k, v = part.split('=', 1)
+                        if k.strip():
+                            fresh[k.strip()] = v.strip()
+        if not fresh.get('MUSIC_U'):
+            state['status'] = 'expired'
+            logger.warning("[扫码登录] 登录成功但未拿到 MUSIC_U，请改用 /导入cookie")
+            return
+
+        self._cookies.update(fresh)
+        if self._http_session and not self._http_session.closed:
+            for k, v in fresh.items():
+                self._http_session.cookie_jar.update_cookies(
+                    {k: v}, response_url=aiohttp.client.URL(NETEASE)
+                )
+
+        # 拉取账号信息：既用于提示文案，也顺带验证凭证是否真的可用
+        profile = await self._fetch_account_profile()
+        if profile:
+            self._user_info = profile
+        self._save_cookies()
+
+        state['status'] = 'success'
+        state['nickname'] = (self._user_info or {}).get('nickname') or '已登录用户'
+        state['vip_type'] = (self._user_info or {}).get('vip_type') or 0
+        logger.info(
+            f"[扫码登录] 登录成功，用户 {state['nickname']}，"
+            f"Cookie 数量 {len(self._cookies)}"
+        )
+
+    async def _fetch_account_profile(self) -> Optional[Dict[str, Any]]:
+        """查询当前账号信息；未登录或凭证失效时返回 None"""
+        data = await self._api_post_form('/api/nuser/account/get', {})
+        if not data:
+            return None
+        account = data.get('account') or {}
+        profile = data.get('profile') or {}
+        if not account.get('id'):
+            return None
+        vip = data.get('associator') or {}
+        return {
+            'user_id': account.get('id'),
+            'nickname': profile.get('nickname') or '已登录用户',
+            'avatar': profile.get('avatarUrl') or '',
+            'vip_type': vip.get('vipCode') or 0,
+            'vip_expire': vip.get('expireTime') or 0,
+        }
+
+    def _qr_state_text(self, state: Dict[str, Any]) -> str:
+        status = state.get('status')
+        return {
+            'waiting': '⏳ 等待扫码',
+            'scanned': '📱 已扫码，请在手机上点击「确认登录」',
+            'success': '✅ 登录成功',
+            'expired': '⌛ 二维码已过期',
+            'canceled': '🚫 已取消',
+        }.get(status, status or '未知')
+
+    async def _qr_status_loop(self, event: AstrMessageEvent):
+        """边等待边播报扫码状态，最多等 QR_LOGIN_TTL 秒"""
+        deadline = time.time() + QR_LOGIN_TTL + 5
+        last = None
+        while time.time() < deadline:
+            state = self._qr_session(event)
+            if not state:
+                yield event.plain_result("⌛ 扫码会话已结束，请重新发送 /扫码登录")
+                return
+            status = state.get('status')
+            if status != last:
+                last = status
+                if status == 'waiting':
+                    yield event.plain_result(
+                        f"⏳ 请用手机网易云音乐 App 扫描二维码（{QR_LOGIN_TTL} 秒内有效）"
+                    )
+                elif status == 'scanned':
+                    yield event.plain_result("📱 已扫码，请在手机上点击「确认登录」")
+                elif status == 'success':
+                    nickname = state.get('nickname') or '已登录用户'
+                    vip_type = int(state.get('vip_type') or 0)
+                    vip_text = '（VIP，可播放会员曲目）' if vip_type else '（非 VIP 账号）'
+                    yield event.plain_result(
+                        f"✅ 登录成功！\n"
+                        f"账号: {nickname}{vip_text}\n"
+                        f"登录凭证已保存，发送 /点歌 歌曲名 试试吧"
+                    )
+                    self._qr_sessions.pop(self._qr_owner(event), None)
+                    return
+                elif status == 'expired':
+                    yield event.plain_result(
+                        "⌛ 二维码已过期，请重新发送 /扫码登录 获取新的二维码"
+                    )
+                    self._qr_sessions.pop(self._qr_owner(event), None)
+                    return
+            await asyncio.sleep(2)
+        yield event.plain_result("⌛ 等待扫码超时，请重新发送 /扫码登录")
+
+
     # ==================== 通用 HTTP ====================
 
     def _netease_api_base(self) -> str:
@@ -808,32 +1460,32 @@ class NeteaseMusicPlugin(Star):
 
     async def _api_get(self, path: str, params: Optional[Dict] = None) -> Optional[Dict]:
         """GET 请求网易云 API（直连官方；配置了自建 API 时自动适配到自建）"""
-        try:
-            session = await self._get_http_session()
-            proxy = self._get_proxy()
-            params = dict(params or {})
-            base = self._netease_api_base()
-            if base:
-                path, params = self._to_self_hosted_request(path, params)
-                self._attach_cookie_param(params)
-                url = f"{base}{path}"
-            else:
-                params['timestamp'] = int(time.time() * 1000)
-                url = f"{NETEASE}{path}"
-
-            async with session.get(
-                url,
-                params=params,
-                headers=DEFAULT_HEADERS,
-                proxy=proxy
-            ) as resp:
-                return await resp.json(content_type=None)
-        except Exception as e:
-            logger.error(f"GET {path} 失败: {e}")
-            return None
+        return await self._request_json("GET", path, params)
 
     async def _api_post_form(self, path: str, params: Optional[Dict] = None) -> Optional[Dict]:
         """POST form-urlencoded 请求网易云 API（直连官方；配置了自建 API 时自动适配到自建）"""
+        return await self._request_json(
+            "POST",
+            path,
+            params,
+            headers={
+                **DEFAULT_HEADERS,
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+        )
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """统一的 JSON 请求入口；cookie 过期等需要识别 Set-Cookie 的调用走这里
+
+        self._last_set_cookies 会在每次请求后被刷新（仅在本次响应带了 Set-Cookie 时）。
+        """
+        self._last_set_cookies = {}
         try:
             session = await self._get_http_session()
             proxy = self._get_proxy()
@@ -847,18 +1499,34 @@ class NeteaseMusicPlugin(Star):
                 params['timestamp'] = int(time.time() * 1000)
                 url = f"{NETEASE}{path}"
 
-            headers = {**DEFAULT_HEADERS, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}
-
+            req_headers = dict(headers or DEFAULT_HEADERS)
+            if method.upper() == "GET":
+                async with session.get(
+                    url, params=params, headers=req_headers, proxy=proxy
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    self._collect_set_cookies(resp)
+                    return data
             async with session.post(
-                url,
-                data=params,
-                headers=headers,
-                proxy=proxy
+                url, data=params, headers=req_headers, proxy=proxy
             ) as resp:
-                return await resp.json(content_type=None)
+                data = await resp.json(content_type=None)
+                self._collect_set_cookies(resp)
+                return data
         except Exception as e:
-            logger.error(f"POST {path} 失败: {e}")
+            logger.error(f"{method} {path} 失败: {e}")
             return None
+
+    def _collect_set_cookies(self, resp) -> None:
+        """记录响应里的 Set-Cookie（扫码登录成功后会下发 MUSIC_U 等登录凭证）"""
+        try:
+            cookies = resp.cookies
+        except Exception:
+            return
+        for name, morsel in (cookies or {}).items():
+            value = getattr(morsel, "value", morsel)
+            if value:
+                self._last_set_cookies[name] = str(value)
 
     # ==================== 指令：点歌帮助 ====================
 
@@ -4629,7 +5297,8 @@ class NeteaseMusicPlugin(Star):
         if not self._cookies:
             yield event.plain_result(
                 "📭 当前没有导入任何 Cookie。\n"
-                "发送 /导入cookie 查看导入教程。"
+                "发送 /扫码登录 用手机网易云 App 扫码登录（推荐），"
+                "或发送 /导入cookie 查看手动导入教程。"
             )
             return
 
@@ -4661,6 +5330,96 @@ class NeteaseMusicPlugin(Star):
             except OSError as e:
                 logger.warning(f"删除 Cookie 文件失败: {e}")
         yield event.plain_result("✅ 已清除所有 Cookie。")
+
+    # ==================== 指令：扫码登录 ====================
+
+    @filter.command("扫码登录", alias={"扫码登陆", "登录"})
+    async def cmd_qr_login(self, event: AstrMessageEvent):
+        """用手机网易云音乐 App 扫码登录（替代手动复制 Cookie）"""
+        _admin = self._require_admin(event)
+        if _admin:
+            yield event.plain_result(_admin)
+            return
+
+        if self._cookies.get('MUSIC_U'):
+            profile = await self._fetch_account_profile()
+            if profile:
+                yield event.plain_result(
+                    f"✅ 当前已登录：{profile.get('nickname')}\n"
+                    f"如需切换账号，请先发送 /退出登录 再重新扫码"
+                )
+                return
+
+        try:
+            state = await self._qr_start(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[扫码登录] 创建会话失败: {e}")
+            yield event.plain_result(f"❌ 获取登录二维码失败：{e}\n可改用 /导入cookie")
+            return
+
+        image_path = state['image_path']
+        yield event.image_result(image_path)
+        yield event.plain_result(
+            "📱 扫码登录步骤：\n"
+            "1. 打开手机「网易云音乐」App，点右上角「+」→「扫一扫」\n"
+            f"2. 扫描上面的二维码（{QR_LOGIN_TTL} 秒内有效）\n"
+            "3. 在手机上点击「确认登录」\n\n"
+            "💡 无法扫码时，可发送 /扫码状态 查看进度，"
+            "或改用 /导入cookie 手动导入。"
+        )
+        self._schedule_tempfile_cleanup(image_path, delay=QR_LOGIN_TTL + 60)
+
+        async for result in self._qr_status_loop(event):
+            yield result
+
+    @filter.command("扫码状态", alias={"登录状态"})
+    async def cmd_qr_status(self, event: AstrMessageEvent):
+        """查看扫码登录进度与当前账号状态"""
+        state = self._qr_session(event)
+        lines = ["🎵 登录状态", "━━━━━━━━━━━━━━"]
+        if state:
+            remain = max(0, int(state['expire_at'] - time.time()))
+            lines.append(f"扫码进度: {self._qr_state_text(state)}")
+            if state['status'] in ('waiting', 'scanned'):
+                lines.append(f"剩余时间: {remain} 秒")
+                lines.append("二维码内容已发送过，直接扫那张图即可")
+        else:
+            lines.append("扫码进度: 当前没有进行中的扫码登录")
+            lines.append("发送 /扫码登录 获取二维码")
+
+        profile = await self._fetch_account_profile() if self._cookies else None
+        if profile:
+            vip_type = int(profile.get('vip_type') or 0)
+            lines.append(f"当前账号: {profile.get('nickname')}")
+            lines.append(f"会员状态: {'VIP' if vip_type else '非 VIP'}")
+        elif self._cookies:
+            lines.append("当前账号: ❌ 登录凭证已失效，请重新 /扫码登录")
+        else:
+            lines.append("当前账号: 未登录（匿名模式）")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("退出登录", alias={"登出"})
+    async def cmd_logout(self, event: AstrMessageEvent):
+        """退出登录：清空扫码会话与已保存的登录凭证"""
+        _admin = self._require_admin(event)
+        if _admin:
+            yield event.plain_result(_admin)
+            return
+
+        await self._qr_cancel(event, reason='canceled')
+        self._cookies = {}
+        self._user_info = {}
+        if self._http_session and not self._http_session.closed:
+            self._http_session.cookie_jar.clear()
+        if os.path.exists(self.cookie_file):
+            try:
+                os.remove(self.cookie_file)
+            except OSError as e:
+                logger.warning(f"删除 Cookie 文件失败: {e}")
+        yield event.plain_result("✅ 已退出登录并清除登录凭证。\n发送 /扫码登录 可重新登录。")
+
 
     # ==================== 歌曲 API ====================
 
@@ -5313,7 +6072,7 @@ class NeteaseMusicPlugin(Star):
             "【留言】/留言",
             "【管理】/删除留言 /删除歌曲 /删除歌单",
             "【绑定】/绑定 /绑定邀请 /同意绑定 /绑定查看 /解绑",
-            "【账号】/导入cookie /查看cookie /清除cookie",
+            "【账号】/扫码登录 /扫码状态 /退出登录 /导入cookie /查看cookie /清除cookie",
         ]
         if self._bili_video_enabled():
             lines.append("【视频】选歌时加「搜索视频」（如 1 搜索视频）→ 再发序号")
@@ -5331,7 +6090,8 @@ class NeteaseMusicPlugin(Star):
             "存歌到歌单：/点歌 晴天 → 再发 1 添加歌单 我的歌单",
             "听歌单里的歌：/歌单 我的歌单 → 再发 1",
             "给歌留言：/留言 我的歌单 1 这首歌真好听",
-            "登录会员：/导入cookie",
+            "登录会员：/扫码登录（手机网易云 App 扫码，推荐）",
+            "手动登录：/导入cookie",
         ]
         if self._bili_search_cmd_enabled():
             lines.append("搜B站视频：/搜视频 关键词 → 再发 5")
