@@ -287,8 +287,11 @@ NETEASE = "https://music.163.com"
 
 # ============ 扫码登录 ============
 QR_LOGIN_TYPE = 3          # unikey 类型：1=web(已废弃) 3=App 扫码
-QR_LOGIN_TTL = 180         # 单个二维码有效期（秒），过期需重新获取
-QR_LOGIN_POLL_INTERVAL = 4  # 后台轮询间隔（秒），网易云官方页面同样按秒级轮询
+QR_LOGIN_TTL = 300          # 单个二维码有效期（秒）；扫码→看手机→点确认要留足时间
+QR_LOGIN_POLL_INTERVAL = 4       # 未扫码时的轮询间隔（秒）
+QR_LOGIN_POLL_FAST = 1.5         # 已扫码待确认后的快速轮询间隔（秒），尽快拿到 800
+QR_LOGIN_POLL_MAX_ERRORS = 8     # 连续空响应/异常的最大容忍次数，超过才判定失败
+QR_LOGIN_EXPIRE_WARN = 60        # 剩余多少秒时提醒即将过期
 # 轮询返回码：800 成功 / 801 等待扫码 / 802 已扫码待确认 / 803 二维码过期
 _QR_CODE_HINTS = {
     800: "登录成功",
@@ -1279,20 +1282,45 @@ class NeteaseMusicPlugin(Star):
                 task.cancel()
 
     async def _qr_poll_loop(self, state: Dict[str, Any]) -> None:
-        """后台轮询扫码状态，直到登录成功 / 过期 / 被取消"""
+        """后台轮询扫码状态，直到登录成功 / 过期 / 被取消
+
+        网易云的接口偶尔会返回 HTTP 200 但包体为空，因此这里对空响应做了
+        容忍：连续失败未超过 QR_LOGIN_POLL_MAX_ERRORS 次时继续轮询，
+        避免一次网络抖动就让整个登录流程中断。
+        """
         unikey = state['unikey']
+        errors = 0
         try:
             while time.time() < state['expire_at']:
-                await asyncio.sleep(QR_LOGIN_POLL_INTERVAL)
+                # 已扫码后加速轮询，尽快捕获 800，避免卡在过期边界
+                interval = (
+                    QR_LOGIN_POLL_FAST
+                    if state['status'] == 'scanned'
+                    else QR_LOGIN_POLL_INTERVAL
+                )
+                await asyncio.sleep(interval)
                 if self._qr_sessions.get(state['owner']) is not state:
                     return
                 data = await self._api_post_form(
                     '/api/login/qrcode/client/login',
                     {'key': unikey, 'type': QR_LOGIN_TYPE},
                 )
-                code = (data or {}).get('code')
+                if not data:
+                    errors += 1
+                    logger.debug(
+                        f"[扫码登录] 轮询返回空响应（第 {errors} 次）unikey={unikey}"
+                    )
+                    if errors >= QR_LOGIN_POLL_MAX_ERRORS:
+                        state['status'] = 'expired'
+                        logger.warning(
+                            f"[扫码登录] 连续 {errors} 次空响应，放弃本次登录 unikey={unikey}"
+                        )
+                        return
+                    continue
+                errors = 0
+                code = data.get('code')
                 if code == 800:
-                    await self._qr_finish_login(state, data or {})
+                    await self._qr_finish_login(state, data)
                     return
                 if code == 803:
                     state['status'] = 'expired'
@@ -1301,6 +1329,11 @@ class NeteaseMusicPlugin(Star):
                 if code == 802 and state['status'] != 'scanned':
                     state['status'] = 'scanned'
                     logger.info(f"[扫码登录] 已扫码待确认 unikey={unikey}")
+                    # 扫码后重新计时：确认动作需要时间，避免在边界上过期
+                    state['expire_at'] = max(
+                        state['expire_at'],
+                        time.time() + QR_LOGIN_TTL // 2,
+                    )
                 # 801：继续等待
             state['status'] = 'expired'
             logger.info(f"[扫码登录] 二维码等待超时 unikey={unikey}")
@@ -1311,20 +1344,33 @@ class NeteaseMusicPlugin(Star):
             logger.warning(f"[扫码登录] 轮询异常: {e}")
 
     async def _qr_finish_login(self, state: Dict[str, Any], data: Dict) -> None:
-        """扫码成功：保存下发的登录 Cookie，并记录用户信息"""
-        fresh = self._last_set_cookies or {}
+        """扫码成功：保存下发的登录 Cookie，并记录用户信息
+
+        凭证来源有两种可能：响应头 Set-Cookie，或响应体的 cookie 字段，
+        两种都尝试；都没拿到时记录响应结构（不含具体值）便于排查。
+        """
+        fresh: Dict[str, str] = {}
+        set_cookie_names = list((self._last_set_cookies or {}).keys())
+        fresh.update(self._last_set_cookies or {})
+
         if not fresh.get('MUSIC_U'):
-            # 少数情况下凭证在响应体里，兜底再取一次
+            # 响应体里也可能带完整 cookie 字符串
             body_cookie = data.get('cookie') or ''
-            if 'MUSIC_U=' in body_cookie:
+            if isinstance(body_cookie, str) and 'MUSIC_U=' in body_cookie:
                 for part in body_cookie.split(';'):
                     if '=' in part:
                         k, v = part.split('=', 1)
                         if k.strip():
                             fresh[k.strip()] = v.strip()
+
         if not fresh.get('MUSIC_U'):
-            state['status'] = 'expired'
-            logger.warning("[扫码登录] 登录成功但未拿到 MUSIC_U，请改用 /导入cookie")
+            logger.warning(
+                "[扫码登录] 收到 800 但未解析出 MUSIC_U；"
+                f"Set-Cookie 键={set_cookie_names or '无'}，"
+                f"响应体键={list(data.keys()) if isinstance(data, dict) else type(data).__name__}，"
+                f"body 中 cookie 字段={'有' if data.get('cookie') else '无'}"
+            )
+            state['status'] = 'failed'
             return
 
         self._cookies.update(fresh)
@@ -1338,6 +1384,8 @@ class NeteaseMusicPlugin(Star):
         profile = await self._fetch_account_profile()
         if profile:
             self._user_info = profile
+        else:
+            logger.warning("[扫码登录] 已拿到 MUSIC_U 但账号校验未通过，凭证可能无效")
         self._save_cookies()
 
         state['status'] = 'success'
@@ -1345,7 +1393,8 @@ class NeteaseMusicPlugin(Star):
         state['vip_type'] = (self._user_info or {}).get('vip_type') or 0
         logger.info(
             f"[扫码登录] 登录成功，用户 {state['nickname']}，"
-            f"Cookie 数量 {len(self._cookies)}"
+            f"凭证来源={('Set-Cookie' if set_cookie_names else '响应体 cookie 字段')}，"
+            f"Cookie 数量 {len(self._cookies)}，账号校验={'通过' if profile else '未通过'}"
         )
 
     async def _fetch_account_profile(self) -> Optional[Dict[str, Any]]:
@@ -1373,6 +1422,7 @@ class NeteaseMusicPlugin(Star):
             'scanned': '📱 已扫码，请在手机上点击「确认登录」',
             'success': '✅ 登录成功',
             'expired': '⌛ 二维码已过期',
+            'failed': '⚠️ 登录失败（未拿到凭证）',
             'canceled': '🚫 已取消',
         }.get(status, status or '未知')
 
@@ -1380,12 +1430,25 @@ class NeteaseMusicPlugin(Star):
         """边等待边播报扫码状态，最多等 QR_LOGIN_TTL 秒"""
         deadline = time.time() + QR_LOGIN_TTL + 5
         last = None
+        warned_expire = False
         while time.time() < deadline:
             state = self._qr_session(event)
             if not state:
                 yield event.plain_result("⌛ 扫码会话已结束，请重新发送 /扫码登录")
                 return
             status = state.get('status')
+            # 剩余时间不足时提醒一次，避免用户错过确认时机
+            remain = int(state.get('expire_at', 0) - time.time())
+            if (
+                not warned_expire
+                and status in ('waiting', 'scanned')
+                and 0 < remain <= QR_LOGIN_EXPIRE_WARN
+            ):
+                warned_expire = True
+                yield event.plain_result(
+                    f"⏰ 二维码还有 {remain} 秒过期，请尽快在手机上确认登录\n"
+                    f"过期后可发送 /扫码登录 重新获取"
+                )
             if status != last:
                 last = status
                 if status == 'waiting':
@@ -1393,7 +1456,10 @@ class NeteaseMusicPlugin(Star):
                         f"⏳ 请用手机网易云音乐 App 扫描二维码（{QR_LOGIN_TTL} 秒内有效）"
                     )
                 elif status == 'scanned':
-                    yield event.plain_result("📱 已扫码，请在手机上点击「确认登录」")
+                    yield event.plain_result(
+                        "📱 已扫码，请在手机上点击「确认登录」\n"
+                        "（确认后这里会立即显示登录结果）"
+                    )
                 elif status == 'success':
                     nickname = state.get('nickname') or '已登录用户'
                     vip_type = int(state.get('vip_type') or 0)
@@ -1402,6 +1468,13 @@ class NeteaseMusicPlugin(Star):
                         f"✅ 登录成功！\n"
                         f"账号: {nickname}{vip_text}\n"
                         f"登录凭证已保存，发送 /点歌 歌曲名 试试吧"
+                    )
+                    self._qr_sessions.pop(self._qr_owner(event), None)
+                    return
+                elif status == 'failed':
+                    yield event.plain_result(
+                        "⚠️ 扫码已确认，但未拿到登录凭证。\n"
+                        "请发送 /扫码登录 重试；若仍失败，改用 /导入cookie 手动导入。"
                     )
                     self._qr_sessions.pop(self._qr_owner(event), None)
                     return
@@ -1504,17 +1577,33 @@ class NeteaseMusicPlugin(Star):
                 async with session.get(
                     url, params=params, headers=req_headers, proxy=proxy
                 ) as resp:
-                    data = await resp.json(content_type=None)
                     self._collect_set_cookies(resp)
-                    return data
+                    return await self._read_json_body(resp)
             async with session.post(
                 url, data=params, headers=req_headers, proxy=proxy
             ) as resp:
-                data = await resp.json(content_type=None)
                 self._collect_set_cookies(resp)
-                return data
+                return await self._read_json_body(resp)
         except Exception as e:
             logger.error(f"{method} {path} 失败: {e}")
+            return None
+
+    @staticmethod
+    async def _read_json_body(resp) -> Optional[Dict]:
+        """读取 JSON 响应体，空包体或非法 JSON 时返回 None 而不是抛异常
+
+        网易云接口偶发「HTTP 200 + 空 body」，若直接 resp.json() 会抛
+        JSONDecodeError，把一次可重试的抖动变成整个流程失败。
+        """
+        try:
+            raw = await resp.read()
+        except Exception:
+            return None
+        if not raw or not raw.strip():
+            return None
+        try:
+            return json.loads(raw.decode(resp.charset or "utf-8", "replace"))
+        except Exception:
             return None
 
     def _collect_set_cookies(self, resp) -> None:
