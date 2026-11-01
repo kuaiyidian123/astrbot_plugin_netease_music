@@ -292,6 +292,10 @@ QR_LOGIN_POLL_INTERVAL = 4       # 未扫码时的轮询间隔（秒）
 QR_LOGIN_POLL_FAST = 1.5         # 已扫码待确认后的快速轮询间隔（秒），尽快拿到 800
 QR_LOGIN_POLL_MAX_ERRORS = 8     # 连续空响应/异常的最大容忍次数，超过才判定失败
 QR_LOGIN_EXPIRE_WARN = 60        # 剩余多少秒时提醒即将过期
+# 需要立即终止轮询并提示用户的状态码
+QR_LOGIN_BLOCKED_CODES = {
+    8821: "网易云风控拦截：请切换其他登录方式或升级新版本再试",
+}
 # 轮询返回码：800 成功 / 801 等待扫码 / 802 已扫码待确认 / 803 二维码过期
 _QR_CODE_HINTS = {
     800: "登录成功",
@@ -997,9 +1001,11 @@ class NeteaseMusicPlugin(Star):
     async def terminate(self):
         # 先取消所有扫码登录轮询任务，避免卸载后后台任务继续跑
         for state in list(self._qr_sessions.values()):
-            task = state.get('task')
-            if task and not task.done():
-                task.cancel()
+            state['closed'] = True
+            for key in ('poll_task', 'task'):
+                task = state.get(key)
+                if task and not task.done():
+                    task.cancel()
         self._qr_sessions.clear()
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
@@ -1224,13 +1230,70 @@ class NeteaseMusicPlugin(Star):
         """扫码会话归属：按「会话 + 用户」隔离，避免群内多人互相覆盖登录状态"""
         return self._get_session_key(event)
 
-    async def _qr_start(self, event: AstrMessageEvent) -> Dict[str, Any]:
+    def _qr_find(self, event: AstrMessageEvent) -> Optional[Dict[str, Any]]:
+        """查找当前事件对应的扫码会话
+
+        不能直接用 _qr_owner(event) 精确匹配：消息事件对象在后续处理中可能被
+        复用或字段被清空（event.message_obj.sender 取不到时会退化），此时重算
+        出的 key 会和启动时存下的不一致，导致「会话突然不存在」而提前退出。
+        因此这里先精确匹配，再退化到「同一会话」或「唯一活跃会话」匹配。
+        """
+        owner = self._qr_owner(event)
+        state = self._qr_sessions.get(owner)
+        if state:
+            return state
+        # 退化 1：只保留会话维度（忽略用户），适用于取不到发送者 ID 的情况
+        try:
+            sess_prefix = f"session_{event.session_id}_"
+        except Exception:
+            sess_prefix = None
+        if sess_prefix:
+            for key, val in self._qr_sessions.items():
+                if key.startswith(sess_prefix) and val.get('status') in (
+                    'waiting', 'scanned'
+                ):
+                    logger.debug(
+                        f"[扫码登录] 会话键不匹配，退化为会话级匹配 "
+                        f"owner={owner} -> {key}"
+                    )
+                    return val
+        # 退化 2：只有一个活跃会话时直接用它（单用户/私聊场景）
+        active = [
+            v for v in self._qr_sessions.values()
+            if v.get('status') in ('waiting', 'scanned')
+        ]
+        if len(active) == 1:
+            logger.debug(
+                f"[扫码登录] 会话键不匹配且仅一个活跃会话，直接复用 "
+                f"owner={owner}"
+            )
+            return active[0]
+        return None
+
+    def _qr_drop(self, state: Dict[str, Any]) -> None:
+        """按对象删除扫码会话（不依赖重新计算的 owner 键）
+
+        退化匹配时 key 可能与 _qr_owner(event) 不同，按 key pop 会删错或删不掉，
+        这里直接按对象身份定位真正的 key。
+        """
+        state['closed'] = True
+        for key, val in list(self._qr_sessions.items()):
+            if val is state:
+                self._qr_sessions.pop(key, None)
+                return
+
+    async def _qr_start(self, event: AstrMessageEvent) -> None:
         """创建新的扫码登录会话（同用户重复发起会先取消旧会话）"""
         owner = self._qr_owner(event)
         async with self._qr_lock:
             old = self._qr_sessions.pop(owner, None)
-            if old and old.get('task') and not old['task'].done():
-                old['task'].cancel()
+            if old:
+                # 旧会话必须标记关闭并取消轮询，否则旧任务的轮询会一直空跑
+                old['closed'] = True
+                for key in ('poll_task', 'task'):
+                    task = old.get(key)
+                    if task and not task.done():
+                        task.cancel()
 
             data = await self._api_post_form(
                 '/api/login/qrcode/unikey', {'type': QR_LOGIN_TYPE}
@@ -1261,21 +1324,23 @@ class NeteaseMusicPlugin(Star):
             'expire_at': time.time() + QR_LOGIN_TTL,
             'poll_task': None,
             'task': None,
+            'closed': False,          # 轮询据此判断是否已被取消/结束
         }
-        state['poll_task'] = asyncio.create_task(self._qr_poll_loop(state))
+        # 先入表再起任务，避免轮询第一轮在字典里查不到自己
         self._qr_sessions[owner] = state
+        state['poll_task'] = asyncio.create_task(self._qr_poll_loop(state))
         logger.info(f"[扫码登录] 已生成二维码 unikey={unikey}")
-        return state
 
     def _qr_session(self, event: AstrMessageEvent) -> Optional[Dict[str, Any]]:
-        return self._qr_sessions.get(self._qr_owner(event))
+        return self._qr_find(event)
 
     async def _qr_cancel(self, event: AstrMessageEvent, reason: str = 'canceled') -> None:
-        owner = self._qr_owner(event)
-        state = self._qr_sessions.pop(owner, None)
+        state = self._qr_find(event)
         if not state:
             return
         state['status'] = reason
+        state['closed'] = True
+        self._qr_drop(state)
         for key in ('poll_task', 'task'):
             task = state.get(key)
             if task and not task.done():
@@ -1290,6 +1355,10 @@ class NeteaseMusicPlugin(Star):
         """
         unikey = state['unikey']
         errors = 0
+        unknown: Dict[Any, int] = {}
+        # 每轮都记日志，排障时能看出轮询是否还在跑
+        beat = 0
+        logger.info(f"[扫码登录] 轮询已启动 unikey={unikey} TTL={QR_LOGIN_TTL}s")
         try:
             while time.time() < state['expire_at']:
                 # 已扫码后加速轮询，尽快捕获 800，避免卡在过期边界
@@ -1299,11 +1368,23 @@ class NeteaseMusicPlugin(Star):
                     else QR_LOGIN_POLL_INTERVAL
                 )
                 await asyncio.sleep(interval)
-                if self._qr_sessions.get(state['owner']) is not state:
+                # 用会话自身的终止标志判断是否该停，而不是回查字典：
+                # 字典键依赖 _qr_owner(event) 的动态计算结果，键一旦对不上
+                # 就会把仍然有效的轮询误判为「已取消」而静默退出。
+                if state.get('closed'):
+                    logger.info(f"[扫码登录] 轮询因会话关闭而退出 unikey={unikey}")
                     return
+                beat += 1
+                logger.info(f"[扫码登录] 轮询第 {beat} 次请求 unikey={unikey}")
                 data = await self._api_post_form(
                     '/api/login/qrcode/client/login',
                     {'key': unikey, 'type': QR_LOGIN_TYPE},
+                )
+                # 心跳用 info：AstrBot 默认日志级别就是 INFO，用 debug 会完全看不到，
+                # 排障时无法判断轮询是否在跑。每 4 秒一条，量不大。
+                logger.info(
+                    f"[扫码登录] 心跳 #{beat} 响应={data if data else '空'} "
+                    f"剩余={int(state['expire_at'] - time.time())}s"
                 )
                 if not data:
                     errors += 1
@@ -1334,14 +1415,37 @@ class NeteaseMusicPlugin(Star):
                         state['expire_at'],
                         time.time() + QR_LOGIN_TTL // 2,
                     )
+                    continue
+                if code in QR_LOGIN_BLOCKED_CODES:
+                    # 8821「请切换其他登录方式或升级新版本再试」= 网易云风控，
+                    # 常见于扫码用的是截图、短时间频繁扫码、账号被判定环境异常。
+                    state['status'] = 'blocked'
+                    state['blocked_msg'] = data.get('message') or ''
+                    state['blocked_url'] = data.get('redirectUrl') or ''
+                    logger.warning(
+                        f"[扫码登录] 被网易云风控拦截 code={code} "
+                        f"message={data.get('message')} "
+                        f"redirectUrl={data.get('redirectUrl')}"
+                    )
+                    return
+                if code == 801:
+                    continue
+                # 其它未知状态码：记录一次便于排查，但不中断轮询
+                unknown.setdefault(code, 0)
+                unknown[code] += 1
+                if unknown[code] == 1:
+                    logger.info(
+                        f"[扫码登录] 未识别的状态码 code={code} 响应={data}"
+                    )
                 # 801：继续等待
             state['status'] = 'expired'
             logger.info(f"[扫码登录] 二维码等待超时 unikey={unikey}")
         except asyncio.CancelledError:
+            logger.info(f"[扫码登录] 轮询被取消 unikey={unikey}")
             raise
         except Exception as e:
             state['status'] = 'expired'
-            logger.warning(f"[扫码登录] 轮询异常: {e}")
+            logger.warning(f"[扫码登录] 轮询异常: {e}", exc_info=True)
 
     async def _qr_finish_login(self, state: Dict[str, Any], data: Dict) -> None:
         """扫码成功：保存下发的登录 Cookie，并记录用户信息
@@ -1423,6 +1527,7 @@ class NeteaseMusicPlugin(Star):
             'success': '✅ 登录成功',
             'expired': '⌛ 二维码已过期',
             'failed': '⚠️ 登录失败（未拿到凭证）',
+            'blocked': '🛡️ 被网易云风控拦截',
             'canceled': '🚫 已取消',
         }.get(status, status or '未知')
 
@@ -1469,20 +1574,35 @@ class NeteaseMusicPlugin(Star):
                         f"账号: {nickname}{vip_text}\n"
                         f"登录凭证已保存，发送 /点歌 歌曲名 试试吧"
                     )
-                    self._qr_sessions.pop(self._qr_owner(event), None)
+                    self._qr_drop(state)
                     return
                 elif status == 'failed':
                     yield event.plain_result(
                         "⚠️ 扫码已确认，但未拿到登录凭证。\n"
                         "请发送 /扫码登录 重试；若仍失败，改用 /导入cookie 手动导入。"
                     )
-                    self._qr_sessions.pop(self._qr_owner(event), None)
+                    self._qr_drop(state)
+                    return
+                elif status == 'blocked':
+                    msg = state.get('blocked_msg') or '请切换其他登录方式或升级新版本再试'
+                    yield event.plain_result(
+                        "🛡️ 扫码被网易云风控拦截\n"
+                        f"网易云返回：{msg}\n\n"
+                        "常见原因：\n"
+                        "• 扫码用的是二维码「截图」而非直接对着屏幕扫\n"
+                        "• 短时间内反复扫码登录（建议隔 5~10 分钟再试）\n"
+                        "• 账号存在异地登录 / VPN / 代理\n"
+                        "• 账号被网易云标记为异常环境\n\n"
+                        "💡 建议改用 /导入cookie 手动导入，"
+                        "或在手机网易云 App 里正常登录一次后再回来扫码。"
+                    )
+                    self._qr_drop(state)
                     return
                 elif status == 'expired':
                     yield event.plain_result(
                         "⌛ 二维码已过期，请重新发送 /扫码登录 获取新的二维码"
                     )
-                    self._qr_sessions.pop(self._qr_owner(event), None)
+                    self._qr_drop(state)
                     return
             await asyncio.sleep(2)
         yield event.plain_result("⌛ 等待扫码超时，请重新发送 /扫码登录")
@@ -5440,7 +5560,10 @@ class NeteaseMusicPlugin(Star):
                 return
 
         try:
-            state = await self._qr_start(event)
+            await self._qr_start(event)
+            state = self._qr_session(event)
+            if not state:
+                raise RuntimeError("会话创建后无法找回，请重试")
         except asyncio.CancelledError:
             raise
         except Exception as e:
